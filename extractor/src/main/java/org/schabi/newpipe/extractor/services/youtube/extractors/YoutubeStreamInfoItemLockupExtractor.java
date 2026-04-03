@@ -17,13 +17,13 @@ import org.schabi.newpipe.extractor.stream.StreamType;
 import org.schabi.newpipe.extractor.utils.JsonUtils;
 import org.schabi.newpipe.extractor.utils.Utils;
 
+import java.util.ArrayList;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -77,30 +77,26 @@ public class YoutubeStreamInfoItemLockupExtractor implements StreamInfoItemExtra
     }
 
     private StreamType determineStreamType() throws ParsingException {
-        if (JsonUtils.getArray(lockupViewModel, "contentImage.thumbnailViewModel.overlays")
-            .streamAsJsonObjects()
-            .flatMap(overlay -> overlay
-                .getObject("thumbnailOverlayBadgeViewModel")
-                .getArray("thumbnailBadges")
-                .streamAsJsonObjects())
-            .map(thumbnailBadge -> thumbnailBadge.getObject("thumbnailBadgeViewModel"))
-            .anyMatch(thumbnailBadgeViewModel -> {
-                if ("THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE".equals(
+        for (final JsonObject thumbnailBadgeViewModel : getThumbnailBadgeViewModels()) {
+            if ("THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE".equals(
                     thumbnailBadgeViewModel.getString("badgeStyle"))) {
-                    return true;
-                }
+                return StreamType.LIVE_STREAM;
+            }
 
-                // Fallback: Check if there is a live icon
-                return thumbnailBadgeViewModel
-                    .getObject("icon")
-                    .getArray("sources")
-                    .streamAsJsonObjects()
-                    .map(source -> source
-                        .getObject("clientResource")
-                        .getString("imageName"))
-                    .anyMatch("LIVE"::equals);
-            })) {
-            return StreamType.LIVE_STREAM;
+            final JsonObject icon = thumbnailBadgeViewModel.getObject("icon");
+            final JsonArray iconSources = icon == null ? null : icon.getArray("sources");
+            if (iconSources == null) {
+                continue;
+            }
+            for (int sourceIndex = 0; sourceIndex < iconSources.size(); sourceIndex++) {
+                final JsonObject source = iconSources.getObject(sourceIndex);
+                final JsonObject clientResource = source == null ? null
+                        : source.getObject("clientResource");
+                if (clientResource != null
+                        && "LIVE".equals(clientResource.getString("imageName"))) {
+                    return StreamType.LIVE_STREAM;
+                }
+            }
         }
 
         return StreamType.VIDEO_STREAM;
@@ -151,17 +147,13 @@ public class YoutubeStreamInfoItemLockupExtractor implements StreamInfoItemExtra
             return -1;
         }
 
-        final List<String> potentialDurations = JsonUtils.getArray(lockupViewModel,
-                "contentImage.thumbnailViewModel.overlays")
-            .streamAsJsonObjects()
-            .flatMap(jsonObject -> jsonObject
-                .getObject("thumbnailOverlayBadgeViewModel")
-                .getArray("thumbnailBadges")
-                .streamAsJsonObjects())
-            .map(jsonObject -> jsonObject
-                .getObject("thumbnailBadgeViewModel")
-                .getString("text"))
-            .collect(Collectors.toList());
+        final List<String> potentialDurations = new ArrayList<>();
+        for (final JsonObject thumbnailBadgeViewModel : getThumbnailBadgeViewModels()) {
+            final String duration = thumbnailBadgeViewModel.getString("text");
+            if (!isNullOrEmpty(duration)) {
+                potentialDurations.add(duration);
+            }
+        }
 
         if (potentialDurations.isEmpty()) {
             throw new ParsingException("Could not get duration: No parsable durations detected");
@@ -177,6 +169,50 @@ public class YoutubeStreamInfoItemLockupExtractor implements StreamInfoItemExtra
         }
 
         throw new ParsingException("Could not get duration", parsingException);
+    }
+
+    @Nonnull
+    private List<JsonObject> getThumbnailBadgeViewModels() throws ParsingException {
+        final List<JsonObject> thumbnailBadgeViewModels = new ArrayList<>();
+        final JsonArray overlays = JsonUtils.getArray(lockupViewModel,
+                "contentImage.thumbnailViewModel.overlays");
+        for (int overlayIndex = 0; overlayIndex < overlays.size(); overlayIndex++) {
+            final JsonObject overlay = overlays.getObject(overlayIndex);
+            if (overlay == null) {
+                continue;
+            }
+
+            final JsonObject badgeOverlay = overlay.getObject("thumbnailOverlayBadgeViewModel");
+            if (badgeOverlay != null) {
+                addThumbnailBadgeViewModels(
+                        thumbnailBadgeViewModels,
+                        badgeOverlay.getArray("thumbnailBadges"));
+            }
+
+            final JsonObject bottomOverlay = overlay.getObject("thumbnailBottomOverlayViewModel");
+            if (bottomOverlay != null) {
+                addThumbnailBadgeViewModels(
+                        thumbnailBadgeViewModels,
+                        bottomOverlay.getArray("badges"));
+            }
+        }
+        return thumbnailBadgeViewModels;
+    }
+
+    private static void addThumbnailBadgeViewModels(
+            @Nonnull final List<JsonObject> target,
+            @Nullable final JsonArray badges) {
+        if (badges == null) {
+            return;
+        }
+        for (int badgeIndex = 0; badgeIndex < badges.size(); badgeIndex++) {
+            final JsonObject badge = badges.getObject(badgeIndex);
+            final JsonObject thumbnailBadgeViewModel =
+                    badge == null ? null : badge.getObject("thumbnailBadgeViewModel");
+            if (thumbnailBadgeViewModel != null) {
+                target.add(thumbnailBadgeViewModel);
+            }
+        }
     }
 
     @Override

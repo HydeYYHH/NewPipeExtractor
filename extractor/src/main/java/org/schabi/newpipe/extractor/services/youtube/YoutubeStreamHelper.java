@@ -47,6 +47,47 @@ public final class YoutubeStreamHelper {
     }
 
     @Nonnull
+    public static JsonObject getWebPlayerResponse(
+            @Nonnull final Localization localization,
+            @Nonnull final ContentCountry contentCountry,
+            @Nonnull final String videoId,
+            @Nonnull final String cpn,
+            @Nullable final PoTokenResult webPoTokenResult,
+            final int signatureTimestamp) throws IOException, ExtractionException {
+        final InnertubeClientRequestInfo innertubeClientRequestInfo =
+                InnertubeClientRequestInfo.ofWebClient();
+        innertubeClientRequestInfo.clientInfo.clientVersion = getClientVersion();
+
+        final Map<String, List<String>> headers = getYouTubeHeaders();
+        final String watchUrl = BASE_YT_DESKTOP_WATCH_URL + videoId;
+
+        // We must always pass a valid visitorData to get valid player responses, which needs to be
+        // got from YouTube
+        innertubeClientRequestInfo.clientInfo.visitorData = webPoTokenResult == null
+                ? YoutubeParsingHelper.getVisitorDataFromInnertube(innertubeClientRequestInfo,
+                        localization, contentCountry, headers, YOUTUBEI_V1_URL, null, false)
+                : webPoTokenResult.visitorData;
+
+        final JsonBuilder<JsonObject> builder = prepareJsonBuilder(localization, contentCountry,
+                innertubeClientRequestInfo, null);
+
+        addVideoIdCpnAndOkChecks(builder, videoId, cpn);
+        addPlaybackContext(builder, watchUrl, signatureTimestamp);
+
+        if (webPoTokenResult != null) {
+            addPoToken(builder, webPoTokenResult.playerRequestPoToken);
+        }
+
+        final byte[] body = JsonWriter.string(builder.done())
+                .getBytes(StandardCharsets.UTF_8);
+
+        final String url = YOUTUBEI_V1_URL + PLAYER + "?" + DISABLE_PRETTY_PRINT_PARAMETER;
+
+        return JsonUtils.toJsonObject(getValidJsonResponseBody(
+                getDownloader().postWithContentTypeJson(url, headers, body, localization)));
+    }
+
+    @Nonnull
     public static JsonObject getWebMetadataPlayerResponse(
             @Nonnull final Localization localization,
             @Nonnull final ContentCountry contentCountry,

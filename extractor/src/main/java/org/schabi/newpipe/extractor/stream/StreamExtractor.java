@@ -51,9 +51,41 @@ public abstract class StreamExtractor extends Extractor {
 
     public static final int NO_AGE_LIMIT = 0;
     public static final long UNKNOWN_SUBSCRIBER_COUNT = -1;
+    private boolean streamOnlyRequest;
+    private boolean pageFetchedForStreamsOnly;
 
     public StreamExtractor(final StreamingService service, final LinkHandler linkHandler) {
         super(service, linkHandler);
+    }
+
+    @Override
+    public void fetchPage() throws IOException, ExtractionException {
+        if (isPageFetched()) {
+            if (pageFetchedForStreamsOnly) {
+                throw new IllegalStateException(
+                        "Page was already fetched for streams only with this extractor");
+            }
+            return;
+        }
+        super.fetchPage();
+    }
+
+    public void fetchPageForStreams() throws IOException, ExtractionException {
+        if (isPageFetched()) {
+            return;
+        }
+
+        streamOnlyRequest = true;
+        try {
+            super.fetchPage();
+            pageFetchedForStreamsOnly = true;
+        } finally {
+            streamOnlyRequest = false;
+        }
+    }
+
+    protected boolean isStreamOnlyRequest() {
+        return streamOnlyRequest;
     }
 
     /**

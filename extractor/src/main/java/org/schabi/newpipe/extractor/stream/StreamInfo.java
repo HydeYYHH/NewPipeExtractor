@@ -23,6 +23,7 @@ package org.schabi.newpipe.extractor.stream;
 import org.schabi.newpipe.extractor.Image;
 import org.schabi.newpipe.extractor.Info;
 import org.schabi.newpipe.extractor.InfoItem;
+import org.schabi.newpipe.extractor.InfoItemsCollector;
 import org.schabi.newpipe.extractor.MetaInfo;
 import org.schabi.newpipe.extractor.NewPipe;
 import org.schabi.newpipe.extractor.StreamingService;
@@ -34,6 +35,7 @@ import org.schabi.newpipe.extractor.utils.ExtractorHelper;
 import org.schabi.newpipe.extractor.utils.ExtractorLogger;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.List;
 import java.util.Locale;
 
@@ -89,25 +91,43 @@ public class StreamInfo extends Info {
         return getInfo(service.getStreamExtractor(url));
     }
 
+    public static StreamInfo getStream(@Nonnull final StreamingService service,
+                                       final String url) throws IOException, ExtractionException {
+        return getStream(service.getStreamExtractor(url));
+    }
+
     public static StreamInfo getInfo(@Nonnull final StreamExtractor extractor)
             throws ExtractionException, IOException {
         ExtractorLogger.d(TAG, "getInfo({extractor})", extractor);
-        extractor.fetchPage();
+        return getStreamInfo(extractor, false);
+    }
+
+    public static StreamInfo getStream(@Nonnull final StreamExtractor extractor)
+            throws ExtractionException, IOException {
+        return getStreamInfo(extractor, true);
+    }
+
+    private static StreamInfo getStreamInfo(@Nonnull final StreamExtractor extractor,
+                                            final boolean streamOnly)
+            throws ExtractionException, IOException {
+        if (streamOnly) {
+            extractor.fetchPageForStreams();
+        } else {
+            extractor.fetchPage();
+        }
         final StreamInfo streamInfo;
         try {
-            streamInfo = extractImportantData(extractor);
-            extractStreams(streamInfo, extractor);
-            extractOptionalData(streamInfo, extractor);
+            streamInfo = extractImportantData(extractor, streamOnly);
+            extractStreams(streamInfo, extractor, streamOnly);
+            if (!streamOnly) {
+                extractOptionalData(streamInfo, extractor);
+            }
             return streamInfo;
-
         } catch (final ExtractionException e) {
             // Currently, YouTube does not distinguish between age restricted videos and videos
-            // blocked by country. This means that during the initialisation of the extractor, the
-            // extractor will assume that a video is age restricted while in reality it is blocked
-            // by country.
-            //
-            // We will now detect whether the video is blocked by country or not.
-
+            // blocked by country. This means that during the initialisation of the extractor,
+            // the extractor will assume that a video is age restricted while in reality it is
+            // blocked by country.
             final String errorMessage = extractor.getErrorMessage();
             if (isNullOrEmpty(errorMessage)) {
                 throw e;
@@ -118,8 +138,9 @@ public class StreamInfo extends Info {
     }
 
     @Nonnull
-    private static StreamInfo extractImportantData(@Nonnull final StreamExtractor extractor)
-            throws ExtractionException {
+    private static StreamInfo extractImportantData(@Nonnull final StreamExtractor extractor,
+                                                   final boolean streamOnly)
+            throws ExtractionException, IOException {
         // Important data, without it the content can't be displayed.
         // If one of these is not available, the frontend will receive an exception directly.
 
@@ -127,7 +148,7 @@ public class StreamInfo extends Info {
         final StreamType streamType = extractor.getStreamType();
         final String id = extractor.getId();
         final String name = extractor.getName();
-        final int ageLimit = extractor.getAgeLimit();
+        final int ageLimit = streamOnly ? StreamExtractor.NO_AGE_LIMIT : extractor.getAgeLimit();
 
         // Suppress always-non-null warning as here we double-check it really is not null
         //noinspection ConstantConditions
@@ -145,8 +166,9 @@ public class StreamInfo extends Info {
 
 
     private static void extractStreams(final StreamInfo streamInfo,
-                                       final StreamExtractor extractor)
-            throws ExtractionException {
+                                       final StreamExtractor extractor,
+                                       final boolean streamOnly)
+            throws ExtractionException, InterruptedIOException {
         /* ---- Stream extraction goes here ---- */
         // At least one type of stream has to be available, otherwise an exception will be thrown
         // directly into the frontend.
@@ -154,13 +176,13 @@ public class StreamInfo extends Info {
         try {
             streamInfo.setDashMpdUrl(extractor.getDashMpdUrl());
         } catch (final Exception e) {
-            streamInfo.addError(new ExtractionException("Couldn't get DASH manifest", e));
+            addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get DASH manifest", e);
         }
 
         try {
             streamInfo.setHlsUrl(extractor.getHlsUrl());
         } catch (final Exception e) {
-            streamInfo.addError(new ExtractionException("Couldn't get HLS manifest", e));
+            addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get HLS manifest", e);
         }
 
         try {
@@ -168,19 +190,19 @@ public class StreamInfo extends Info {
         } catch (final ContentNotSupportedException e) {
             throw e;
         } catch (final Exception e) {
-            streamInfo.addError(new ExtractionException("Couldn't get audio streams", e));
+            addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get audio streams", e);
         }
 
         try {
             streamInfo.setVideoStreams(extractor.getVideoStreams());
         } catch (final Exception e) {
-            streamInfo.addError(new ExtractionException("Couldn't get video streams", e));
+            addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get video streams", e);
         }
 
         try {
             streamInfo.setVideoOnlyStreams(extractor.getVideoOnlyStreams());
         } catch (final Exception e) {
-            streamInfo.addError(new ExtractionException("Couldn't get video only streams", e));
+            addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get video only streams", e);
         }
 
         // Either audio or video has to be available, otherwise we didn't get a stream (since
@@ -193,7 +215,8 @@ public class StreamInfo extends Info {
 
     @SuppressWarnings("MethodLength")
     private static void extractOptionalData(final StreamInfo streamInfo,
-                                            final StreamExtractor extractor) {
+                                            final StreamExtractor extractor)
+            throws InterruptedIOException {
         /* ---- Optional data goes here: ---- */
         // If one of these fails, the frontend needs to handle that they are not available.
         // Exceptions are therefore not thrown into the frontend, but stored into the error list,
@@ -202,160 +225,202 @@ public class StreamInfo extends Info {
         try {
             streamInfo.setThumbnails(extractor.getThumbnails());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setDuration(extractor.getLength());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploaderName(extractor.getUploaderName());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploaderUrl(extractor.getUploaderUrl());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploaderAvatars(extractor.getUploaderAvatars());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploaderVerified(extractor.isUploaderVerified());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploaderSubscriberCount(extractor.getUploaderSubscriberCount());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
 
         try {
             streamInfo.setSubChannelName(extractor.getSubChannelName());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setSubChannelUrl(extractor.getSubChannelUrl());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setSubChannelAvatars(extractor.getSubChannelAvatars());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
 
         try {
             streamInfo.setDescription(extractor.getDescription());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setViewCount(extractor.getViewCount());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setTextualUploadDate(extractor.getTextualUploadDate());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setUploadDate(extractor.getUploadDate());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setStartPosition(extractor.getTimeStamp());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setLikeCount(extractor.getLikeCount());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setDislikeCount(extractor.getDislikeCount());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setSubtitles(extractor.getSubtitlesDefault());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
 
         // Additional info
         try {
             streamInfo.setHost(extractor.getHost());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setPrivacy(extractor.getPrivacy());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setCategory(extractor.getCategory());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setLicence(extractor.getLicence());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setLanguageInfo(extractor.getLanguageInfo());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setTags(extractor.getTags());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setSupportInfo(extractor.getSupportInfo());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setStreamSegments(extractor.getStreamSegments());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setMetaInfo(extractor.getMetaInfo());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setPreviewFrames(extractor.getFrames());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setShortFormContent(extractor.isShortFormContent());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
         try {
             streamInfo.setContentAvailability(extractor.getContentAvailability());
         } catch (final Exception e) {
-            streamInfo.addError(e);
+            addErrorUnlessInterrupted(streamInfo, e);
         }
 
-        streamInfo.setRelatedItems(ExtractorHelper.getRelatedItemsOrLogError(streamInfo,
-                extractor));
+        extractRelatedItems(streamInfo, extractor);
+    }
+
+    private static void addErrorUnlessInterrupted(final StreamInfo streamInfo,
+                                                  final Exception exception)
+            throws InterruptedIOException {
+        throwIfInterrupted(exception);
+        streamInfo.addError(exception);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void extractRelatedItems(final StreamInfo streamInfo,
+                                            final StreamExtractor extractor)
+            throws InterruptedIOException {
+        try {
+            final InfoItemsCollector<? extends InfoItem, ?> collector = extractor.getRelatedItems();
+            if (collector == null) {
+                streamInfo.setRelatedItems(List.of());
+                return;
+            }
+
+            streamInfo.addAllErrors(collector.getErrors());
+            streamInfo.setRelatedItems((List<InfoItem>) collector.getItems());
+        } catch (final InterruptedIOException e) {
+            throw e;
+        } catch (final Exception e) {
+            streamInfo.addError(e);
+            streamInfo.setRelatedItems(List.of());
+        }
+    }
+
+    private static void addWrappedErrorUnlessInterrupted(final StreamInfo streamInfo,
+                                                         final String message,
+                                                         final Exception exception)
+            throws InterruptedIOException {
+        throwIfInterrupted(exception);
+        streamInfo.addError(new ExtractionException(message, exception));
+    }
+
+    private static void throwIfInterrupted(final Exception exception)
+            throws InterruptedIOException {
+        if (exception instanceof InterruptedIOException) {
+            throw (InterruptedIOException) exception;
+        }
     }
 
     private StreamType streamType;

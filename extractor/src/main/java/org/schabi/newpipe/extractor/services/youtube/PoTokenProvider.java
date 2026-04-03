@@ -41,9 +41,10 @@ public interface PoTokenProvider {
      * </p>
      *
      * <p>
-     * Note that YouTube desktop website generates two {@code poToken}s:
-     * - one for the player requests {@code poToken}s, using the videoId as the minter value;
-     * - one for the streaming URLs, using a visitor data for logged-out users as the minter value.
+     * Note that YouTube desktop website can require a video-bound {@code poToken} for both player
+     * requests and streaming URLs. Implementations may therefore return the same value for
+     * {@link PoTokenResult#playerRequestPoToken} and
+     * {@link PoTokenResult#streamingDataPoToken}.
      * </p>
      *
      * @return a {@link PoTokenResult} specific to the WEB InnerTube client

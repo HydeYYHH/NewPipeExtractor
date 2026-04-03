@@ -180,6 +180,15 @@ public class YoutubeMixOrPlaylistLockupInfoItemExtractor implements PlaylistInfo
         if (Utils.isNullOrEmpty(id)) {
             id = lockupViewModel.getObject("rendererContext")
                     .getObject("commandContext")
+                    .getObject("onTap")
+                    .getObject("innertubeCommand")
+                    .getObject("watchEndpoint")
+                    .getString("playlistId");
+        }
+
+        if (Utils.isNullOrEmpty(id)) {
+            id = lockupViewModel.getObject("rendererContext")
+                    .getObject("commandContext")
                     .getObject("watchEndpoint")
                     .getString("playlistId");
         }

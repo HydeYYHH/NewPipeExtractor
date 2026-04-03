@@ -1,2 +1,4 @@
 jdk:
-  - openjdk17
+  - openjdk21
+install:
+  - ./gradlew :extractor:publishReleasePublicationToMavenLocal -x test --no-configuration-cache
