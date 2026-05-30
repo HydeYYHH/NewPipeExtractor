@@ -139,7 +139,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private static PoTokenProvider poTokenProvider;
     @Nullable
     private static ClientProfileProvider clientProfileProvider;
-    private static boolean fetchIosClient;
+    private static boolean fetchIosClient = true;
 
     private JsonObject playerResponse;
     private JsonObject nextResponse;
@@ -2426,7 +2426,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
      *
      * <p>
      * This method allows fetching the iOS player response, which can be useful in scenarios where
-     * streams from the iOS player response are needed, especially HLS manifests.
+     * streams from the iOS player response are needed, especially HLS manifests and video-only
+     * streams when YouTube returns SABR-only adaptive formats to Android and WEB clients.
      * </p>
      *
      * <p>
