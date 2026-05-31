@@ -91,11 +91,12 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -104,13 +105,30 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class YoutubeStreamExtractor extends StreamExtractor {
-    private enum Client { ANDROID, WEB, IOS }
+    private enum Client { ANDROID_VR, ANDROID, WEB, IOS }
 
     private enum ManifestKind { DASH, HLS }
 
     private enum StreamChoiceKind { AUDIO, VIDEO_ONLY, MUXED }
 
     private enum AuthScene { ANON, LOGGED_IN, PREMIUM }
+
+    private static final class ClientState {
+        @Nullable
+        private JsonObject streamingData;
+        @Nullable
+        private String contentPlaybackNonce;
+        @Nullable
+        private String streamingUrlsPoToken;
+        private boolean fetched;
+
+        private void clear() {
+            streamingData = null;
+            contentPlaybackNonce = null;
+            streamingUrlsPoToken = null;
+            fetched = false;
+        }
+    }
 
     public interface ClientProfileProvider {
         boolean isLoggedIn();
@@ -144,12 +162,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private JsonObject playerResponse;
     private JsonObject nextResponse;
 
-    @Nullable
-    private JsonObject iosStreamingData;
-    @Nullable
-    private JsonObject androidStreamingData;
-    @Nullable
-    private JsonObject webStreamingData;
+    @Nonnull
+    private final Map<Client, ClientState> clientStates = new EnumMap<>(Client.class);
 
     private JsonObject videoPrimaryInfoRenderer;
     private JsonObject videoSecondaryInfoRenderer;
@@ -159,20 +173,6 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private int ageLimit = -1;
     private StreamType streamType;
 
-    // We need to store the contentPlaybackNonces because we need to append them to videoplayback
-    // URLs (with the cpn parameter).
-    // Also because a nonce should be unique, it should be different between clients used, so
-    // three different strings are used.
-    private String iosCpn;
-    private String androidCpn;
-    private String webCpn;
-
-    @Nullable
-    private String androidStreamingUrlsPoToken;
-    @Nullable
-    private String iosStreamingUrlsPoToken;
-    @Nullable
-    private String webStreamingUrlsPoToken;
     @Nonnull
     private List<ManifestChoice> dashChoices = new ArrayList<>();
     @Nonnull
@@ -197,10 +197,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private PoTokenResult reqWebPoToken;
     private boolean webPoTokenKnown;
     @Nonnull
-    private List<Client> clients = List.of(Client.ANDROID, Client.WEB);
-    private boolean androidFetched;
-    private boolean iosFetched;
-    private boolean webFetched;
+    private List<Client> clients = List.of(Client.ANDROID_VR, Client.ANDROID, Client.WEB);
 
     public YoutubeStreamExtractor(final StreamingService service, final LinkHandler linkHandler) {
         super(service, linkHandler);
@@ -412,8 +409,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                     .getString("lengthSeconds");
             return Long.parseLong(duration);
         } catch (final Exception e) {
-            return getDurationFromFirstAdaptiveFormat(Arrays.asList(
-                    androidStreamingData, iosStreamingData));
+            return getDurationFromFirstAdaptiveFormat(clientStates.values().stream()
+                    .map(state -> state.streamingData)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList()));
         }
     }
 
@@ -1067,10 +1066,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         switch (authScene()) {
             case PREMIUM:
             case LOGGED_IN:
-                return List.of(Client.WEB, Client.ANDROID);
+                return List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
             case ANON:
             default:
-                return List.of(Client.ANDROID, Client.WEB);
+                return List.of(Client.ANDROID_VR, Client.ANDROID, Client.WEB);
         }
     }
 
@@ -1086,16 +1085,21 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 case PREMIUM:
                 case LOGGED_IN:
                     return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID)
-                            : List.of(Client.WEB, Client.ANDROID);
+                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR, Client.ANDROID)
+                            : List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
                 case ANON:
                 default:
                     return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID)
-                            : List.of(Client.WEB, Client.ANDROID);
+                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR, Client.ANDROID)
+                            : List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
             }
         }
         return buildClients();
+    }
+
+    @Nonnull
+    private ClientState clientState(@Nonnull final Client client) {
+        return clientStates.computeIfAbsent(client, key -> new ClientState());
     }
 
     private boolean isLiveScene() {
@@ -1189,25 +1193,27 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 || exception instanceof AccountTerminatedException;
     }
 
-    private void fetchWebClient(@Nonnull final Localization localization,
+    private void fetchWebClient(@Nonnull final Client client,
+                                @Nonnull final Localization localization,
                                 @Nonnull final ContentCountry contentCountry,
                                 @Nonnull final String videoId,
                                 @Nullable final PoTokenResult webPoTokenResult,
                                 final int signatureTimestamp)
             throws IOException, ExtractionException {
-        webCpn = generateContentPlaybackNonce();
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = generateContentPlaybackNonce();
 
         playerResponse = YoutubeStreamHelper.getWebPlayerResponse(
-                localization, contentCountry, videoId, webCpn, webPoTokenResult,
-                signatureTimestamp);
+                localization, contentCountry, videoId, state.contentPlaybackNonce,
+                webPoTokenResult, signatureTimestamp);
 
         checkPlayabilityStatus(playerResponse.getObject(PLAYABILITY_STATUS));
         if (isPlayerResponseNotValid(playerResponse, videoId)) {
             throw new ExtractionException("WEB player response is not valid");
         }
 
-        webStreamingData = playerResponse.getObject(STREAMING_DATA);
-        if (!hasUsableStreamingData(webStreamingData)) {
+        state.streamingData = playerResponse.getObject(STREAMING_DATA);
+        if (!hasUsableStreamingData(state.streamingData)) {
             throw new ExtractionException("WEB player response has no usable streaming data");
         }
 
@@ -1215,12 +1221,13 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
 
         if (webPoTokenResult != null) {
-            webStreamingUrlsPoToken = webPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = webPoTokenResult.streamingDataPoToken;
         }
-        webFetched = true;
+        state.fetched = true;
     }
 
-    private void prefetchWebClient(@Nonnull final Localization localization,
+    private void prefetchWebClient(@Nonnull final Client client,
+                                   @Nonnull final Localization localization,
                                    @Nonnull final ContentCountry contentCountry,
                                    @Nonnull final String videoId,
                                    @Nullable final PoTokenResult webPoTokenResult,
@@ -1240,31 +1247,37 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             throw new ExtractionException("WEB player response has no usable streaming data");
         }
 
-        webCpn = cpn;
-        webStreamingData = streamingData;
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = cpn;
+        state.streamingData = streamingData;
         if (webPoTokenResult != null) {
-            webStreamingUrlsPoToken = webPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = webPoTokenResult.streamingDataPoToken;
         }
         if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
             playerCaptionsTracklistRenderer = webPlayerResponse.getObject(CAPTIONS)
                     .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
         }
-        webFetched = true;
+        state.fetched = true;
     }
 
-    private void fetchAndroidClient(@Nonnull final Localization localization,
+    private void fetchAndroidClient(@Nonnull final Client client,
+                                    @Nonnull final Localization localization,
                                     @Nonnull final ContentCountry contentCountry,
                                     @Nonnull final String videoId,
                                     @Nullable final PoTokenResult androidPoTokenResult)
             throws IOException, ExtractionException {
-        androidCpn = generateContentPlaybackNonce();
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = generateContentPlaybackNonce();
 
-        if (androidPoTokenResult == null) {
+        if (client == Client.ANDROID_VR) {
+            playerResponse = YoutubeStreamHelper.getAndroidVrPlayerResponse(
+                    contentCountry, localization, videoId, state.contentPlaybackNonce);
+        } else if (androidPoTokenResult == null) {
             playerResponse = YoutubeStreamHelper.getAndroidReelPlayerResponse(
-                    contentCountry, localization, videoId, androidCpn);
+                    contentCountry, localization, videoId, state.contentPlaybackNonce);
         } else {
             playerResponse = YoutubeStreamHelper.getAndroidPlayerResponse(
-                    contentCountry, localization, videoId, androidCpn,
+                    contentCountry, localization, videoId, state.contentPlaybackNonce,
                     androidPoTokenResult);
         }
 
@@ -1273,25 +1286,29 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             throw new ExtractionException("ANDROID player response is not valid");
         }
 
-        androidStreamingData = playerResponse.getObject(STREAMING_DATA);
+        state.streamingData = playerResponse.getObject(STREAMING_DATA);
 
         playerCaptionsTracklistRenderer = playerResponse.getObject(CAPTIONS)
                 .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
 
         if (androidPoTokenResult != null) {
-            androidStreamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
         }
-        androidFetched = true;
+        state.fetched = true;
     }
 
-    private void prefetchAndroidClient(@Nonnull final Localization localization,
+    private void prefetchAndroidClient(@Nonnull final Client client,
+                                       @Nonnull final Localization localization,
                                        @Nonnull final ContentCountry contentCountry,
                                        @Nonnull final String videoId,
                                        @Nullable final PoTokenResult androidPoTokenResult)
             throws IOException, ExtractionException {
         final String cpn = generateContentPlaybackNonce();
         final JsonObject androidPlayerResponse;
-        if (androidPoTokenResult == null) {
+        if (client == Client.ANDROID_VR) {
+            androidPlayerResponse = YoutubeStreamHelper.getAndroidVrPlayerResponse(
+                    contentCountry, localization, videoId, cpn);
+        } else if (androidPoTokenResult == null) {
             androidPlayerResponse = YoutubeStreamHelper.getAndroidReelPlayerResponse(
                     contentCountry, localization, videoId, cpn);
         } else {
@@ -1304,28 +1321,31 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             throw new ExtractionException("ANDROID player response is not valid");
         }
 
-        androidCpn = cpn;
-        androidStreamingData = androidPlayerResponse.getObject(STREAMING_DATA);
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = cpn;
+        state.streamingData = androidPlayerResponse.getObject(STREAMING_DATA);
         if (androidPoTokenResult != null) {
-            androidStreamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
         }
         if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
             playerCaptionsTracklistRenderer = androidPlayerResponse.getObject(CAPTIONS)
                     .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
         }
-        androidFetched = true;
+        state.fetched = true;
     }
 
-    private void fetchIosClient(@Nonnull final Localization localization,
+    private void fetchIosClient(@Nonnull final Client client,
+                                @Nonnull final Localization localization,
                                 @Nonnull final ContentCountry contentCountry,
                                 @Nonnull final String videoId,
                                 @Nullable final PoTokenResult iosPoTokenResult,
                                 final boolean required)
             throws IOException, ExtractionException {
-        iosCpn = generateContentPlaybackNonce();
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = generateContentPlaybackNonce();
 
         final JsonObject iosPlayerResponse = YoutubeStreamHelper.getIosPlayerResponse(
-                contentCountry, localization, videoId, iosCpn, iosPoTokenResult);
+                contentCountry, localization, videoId, state.contentPlaybackNonce, iosPoTokenResult);
 
         if (required) {
             playerResponse = iosPlayerResponse;
@@ -1339,8 +1359,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             return;
         }
 
-        iosStreamingData = iosPlayerResponse.getObject(STREAMING_DATA);
-        if (required && !hasUsableStreamingData(iosStreamingData)) {
+        state.streamingData = iosPlayerResponse.getObject(STREAMING_DATA);
+        if (required && !hasUsableStreamingData(state.streamingData)) {
             throw new ExtractionException("IOS player response has no usable streaming data");
         }
 
@@ -1350,12 +1370,13 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         }
 
         if (iosPoTokenResult != null) {
-            iosStreamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
         }
-        iosFetched = true;
+        state.fetched = true;
     }
 
-    private void prefetchIosClient(@Nonnull final Localization localization,
+    private void prefetchIosClient(@Nonnull final Client client,
+                                   @Nonnull final Localization localization,
                                    @Nonnull final ContentCountry contentCountry,
                                    @Nonnull final String videoId,
                                    @Nullable final PoTokenResult iosPoTokenResult)
@@ -1373,16 +1394,17 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             throw new ExtractionException("IOS player response has no usable streaming data");
         }
 
-        iosCpn = cpn;
-        iosStreamingData = streamingData;
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = cpn;
+        state.streamingData = streamingData;
         if (iosPoTokenResult != null) {
-            iosStreamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
+            state.streamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
         }
         if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
             playerCaptionsTracklistRenderer = iosPlayerResponse.getObject(CAPTIONS)
                     .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
         }
-        iosFetched = true;
+        state.fetched = true;
     }
 
     private void fetchWebClientMetadataAndSetThumbnails(
@@ -1443,8 +1465,12 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         final JsonObject mainPlayerResponse = playerResponse;
         try {
             switch (client) {
+                case ANDROID_VR:
+                    fetchAndroidClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                            null);
+                    break;
                 case ANDROID:
-                    fetchAndroidClient(reqLocalization, reqContentCountry, reqVideoId,
+                    fetchAndroidClient(client, reqLocalization, reqContentCountry, reqVideoId,
                             reqAndroidPoToken);
                     break;
                 case WEB:
@@ -1454,11 +1480,11 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                                 : poTokenProvider.getWebClientPoToken(reqVideoId);
                         webPoTokenKnown = true;
                     }
-                    fetchWebClient(reqLocalization, reqContentCountry, reqVideoId, reqWebPoToken,
+                    fetchWebClient(client, reqLocalization, reqContentCountry, reqVideoId, reqWebPoToken,
                             YoutubeJavaScriptPlayerManager.getSignatureTimestamp(reqVideoId));
                     break;
                 case IOS:
-                    fetchIosClient(reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken,
+                    fetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken,
                             required);
                     break;
                 default:
@@ -1474,21 +1500,26 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private void prefetchClient(@Nonnull final Client client)
             throws IOException, ExtractionException {
         switch (client) {
-            case ANDROID:
-                prefetchAndroidClient(reqLocalization, reqContentCountry, reqVideoId, reqAndroidPoToken);
+            case ANDROID_VR:
+                prefetchAndroidClient(client, reqLocalization, reqContentCountry, reqVideoId, null);
                 break;
-            case WEB:
+            case ANDROID:
+                prefetchAndroidClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                        reqAndroidPoToken);
+                break;
+                case WEB:
                 if (!webPoTokenKnown) {
                     reqWebPoToken = poTokenProvider == null
                             ? null
                             : poTokenProvider.getWebClientPoToken(reqVideoId);
                     webPoTokenKnown = true;
                 }
-                prefetchWebClient(reqLocalization, reqContentCountry, reqVideoId, reqWebPoToken,
+                prefetchWebClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                        reqWebPoToken,
                         YoutubeJavaScriptPlayerManager.getSignatureTimestamp(reqVideoId));
                 break;
             case IOS:
-                prefetchIosClient(reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken);
+                prefetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken);
                 break;
             default:
                 throw new ExtractionException("Unsupported client");
@@ -1573,16 +1604,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         return streamingData == null ? null : streamingData.getString(manifestKey);
     }
     private boolean isClientFetched(@Nonnull final Client client) {
-        switch (client) {
-            case ANDROID:
-                return androidFetched;
-            case WEB:
-                return webFetched;
-            case IOS:
-                return iosFetched;
-            default:
-                return false;
-        }
+        return clientState(client).fetched;
     }
     @Nonnull
     private Pair<JsonObject, String> getStreamingDataPair(@Nonnull final Client client) {
@@ -1598,6 +1620,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         switch (client) {
             case ANDROID:
                 return reqAndroidPoToken;
+            case ANDROID_VR:
+                return null;
             case WEB:
                 return reqWebPoToken;
             case IOS:
@@ -1608,66 +1632,18 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     }
     @Nullable
     private JsonObject getStreamingData(@Nonnull final Client client) {
-        switch (client) {
-            case ANDROID:
-                return androidStreamingData;
-            case WEB:
-                return webStreamingData;
-            case IOS:
-                return iosStreamingData;
-            default:
-                return null;
-        }
+        return clientState(client).streamingData;
     }
     @Nullable
     private String getContentPlaybackNonce(@Nonnull final Client client) {
-        switch (client) {
-            case ANDROID:
-                return androidCpn;
-            case WEB:
-                return webCpn;
-            case IOS:
-                return iosCpn;
-            default:
-                return null;
-        }
+        return clientState(client).contentPlaybackNonce;
     }
     @Nullable
     private String getStreamingUrlsPoToken(@Nonnull final Client client) {
-        switch (client) {
-            case ANDROID:
-                return androidStreamingUrlsPoToken;
-            case WEB:
-                return webStreamingUrlsPoToken;
-            case IOS:
-                return iosStreamingUrlsPoToken;
-            default:
-                return null;
-        }
+        return clientState(client).streamingUrlsPoToken;
     }
     private void resetClient(@Nonnull final Client client) {
-        switch (client) {
-            case ANDROID:
-                androidFetched = false;
-                androidStreamingData = null;
-                androidStreamingUrlsPoToken = null;
-                androidCpn = null;
-                break;
-            case WEB:
-                webFetched = false;
-                webStreamingData = null;
-                webStreamingUrlsPoToken = null;
-                webCpn = null;
-                break;
-            case IOS:
-                iosFetched = false;
-                iosStreamingData = null;
-                iosStreamingUrlsPoToken = null;
-                iosCpn = null;
-                break;
-            default:
-                break;
-        }
+        clientState(client).clear();
     }
 
     /**

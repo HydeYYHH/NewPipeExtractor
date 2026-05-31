@@ -6,6 +6,9 @@ import javax.annotation.Nullable;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_CLIENT_ID;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_CLIENT_NAME;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_CLIENT_VERSION;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_VR_CLIENT_ID;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_VR_CLIENT_NAME;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_VR_CLIENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.DESKTOP_CLIENT_PLATFORM;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.EMBED_CLIENT_SCREEN;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_CLIENT_ID;
@@ -132,6 +135,16 @@ public final class InnertubeClientRequestInfo {
                         ANDROID_CLIENT_VERSION, ANDROID_CLIENT_ID, WATCH_CLIENT_SCREEN, null),
                 new InnertubeClientRequestInfo.DeviceInfo(MOBILE_CLIENT_PLATFORM, null, null,
                         "Android", "16", 36));
+    }
+
+    @Nonnull
+    public static InnertubeClientRequestInfo ofAndroidVrClient() {
+        return new InnertubeClientRequestInfo(
+                new InnertubeClientRequestInfo.ClientInfo(ANDROID_VR_CLIENT_NAME,
+                        ANDROID_VR_CLIENT_VERSION, ANDROID_VR_CLIENT_ID, WATCH_CLIENT_SCREEN,
+                        null),
+                new InnertubeClientRequestInfo.DeviceInfo(MOBILE_CLIENT_PLATFORM, "Oculus",
+                        "Quest 3", "Android", "12L", 32));
     }
 
     @Nonnull

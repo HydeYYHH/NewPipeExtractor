@@ -109,4 +109,13 @@ final class ClientsConstants {
      * </p>
      */
     static final String ANDROID_CLIENT_VERSION = "21.03.36";
+
+    // ANDROID_VR (YouTube VR for Oculus), used as a non-SABR direct-stream fallback.
+
+    static final String ANDROID_VR_CLIENT_ID = "28";
+    static final String ANDROID_VR_CLIENT_NAME = "ANDROID_VR";
+    static final String ANDROID_VR_CLIENT_VERSION = "1.65.10";
+    static final String ANDROID_VR_USER_AGENT =
+            "com.google.android.apps.youtube.vr.oculus/1.65.10 "
+                    + "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 }

@@ -17,7 +17,7 @@ class YoutubeStreamExtractorSabrRegressionTest implements InitYoutubeTest {
     private static final String BASE_URL = "https://www.youtube.com/watch?v=";
 
     @ParameterizedTest
-    @ValueSource(strings = {"xYWo4P__vl4", "qyNQy7xJvik"})
+    @ValueSource(strings = {"xYWo4P__vl4", "qyNQy7xJvik", "ICjrsW7AQqI"})
     void videosRolledOutToSabrStillExposeVideoOnlyStreams(final String videoId) throws Exception {
         final YoutubeStreamExtractor extractor = (YoutubeStreamExtractor)
                 YouTube.getStreamExtractor(BASE_URL + videoId);
