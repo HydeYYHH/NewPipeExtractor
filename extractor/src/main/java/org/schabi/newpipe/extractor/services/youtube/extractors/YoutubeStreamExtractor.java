@@ -105,7 +105,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class YoutubeStreamExtractor extends StreamExtractor {
-    private enum Client { ANDROID_VR, ANDROID, WEB, IOS }
+    private enum Client { ANDROID_VR, ANDROID, WEB, IOS, TVHTML5 }
 
     private enum ManifestKind { DASH, HLS }
 
@@ -121,12 +121,20 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         @Nullable
         private String streamingUrlsPoToken;
         private boolean fetched;
+        /**
+         * Background prefetch thread started by {@link #prefetchRemainingClients}. Cleared once
+         * the prefetch completes (successfully or not). {@link #awaitPrefetch} joins it so that
+         * lazy {@code ensureClient*} callers reuse the in-flight request instead of re-fetching.
+         */
+        @Nullable
+        private Thread prefetchThread;
 
         private void clear() {
             streamingData = null;
             contentPlaybackNonce = null;
             streamingUrlsPoToken = null;
             fetched = false;
+            prefetchThread = null;
         }
     }
 
@@ -197,7 +205,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private PoTokenResult reqWebPoToken;
     private boolean webPoTokenKnown;
     @Nonnull
-    private List<Client> clients = List.of(Client.ANDROID_VR, Client.ANDROID, Client.WEB);
+    private List<Client> clients = List.of(Client.ANDROID_VR, Client.WEB, Client.TVHTML5);
 
     public YoutubeStreamExtractor(final StreamingService service, final LinkHandler linkHandler) {
         super(service, linkHandler);
@@ -1006,27 +1014,28 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                         .done())
                 .getBytes(StandardCharsets.UTF_8);
         if (mainClient == Client.WEB) {
-            setMetadataFromPlayerResponse(playerResponse);
-            nextResponse = getJsonPostResponse(NEXT, nextBody, reqLocalization);
-        } else {
+            // Kick off the remaining clients' prefetch as early as possible so it overlaps with
+            // NEXT and metadata extraction. We do NOT join here: getItags' ensureClientForStreams
+            // will awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
+            prefetchRemainingClients(mainClient);
+            // Parallelize NEXT with metadata extraction to avoid the ~1s sequential penalty.
             final JsonObject[] next = new JsonObject[1];
             final Throwable[] error = new Throwable[1];
-            final Thread more = new Thread(() -> {
+            final Thread nextThread = new Thread(() -> {
                 try {
                     next[0] = getJsonPostResponse(NEXT, nextBody, reqLocalization);
                 } catch (final Throwable e) {
                     error[0] = e;
                 }
-            });
-            more.start();
-            fetchWebClientMetadataAndSetThumbnails(
-                    reqLocalization, reqContentCountry, reqVideoId);
+            }, "yt-next");
+            nextThread.start();
+            setMetadataFromPlayerResponse(playerResponse);
             try {
-                more.join();
+                nextThread.join();
             } catch (final InterruptedException e) {
-                more.interrupt();
+                nextThread.interrupt();
                 Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while fetching YouTube metadata", e);
+                throw new IOException("Interrupted while fetching YouTube next response", e);
             }
             if (error[0] instanceof IOException) {
                 throw (IOException) error[0];
@@ -1044,9 +1053,58 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 throw new IOException("Failed to fetch YouTube next response", error[0]);
             }
             nextResponse = next[0];
+            // Prefetch continues in the background; getItags' ensureClientForStreams will
+            // awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
+        } else {
+            // Main client is not WEB (e.g. ANDROID_VR). Fetch NEXT and WEB metadata in parallel
+            // so neither blocks the critical path. The WEB metadata call only provides microformat
+            // and better thumbnails — it's not needed for stream extraction.
+            // Start remaining-client prefetch early so it overlaps with NEXT + metadata too.
+            prefetchRemainingClients(mainClient);
+            final JsonObject[] next = new JsonObject[1];
+            final Throwable[] error = new Throwable[1];
+            final Thread nextThread = new Thread(() -> {
+                try {
+                    next[0] = getJsonPostResponse(NEXT, nextBody, reqLocalization);
+                } catch (final Throwable e) {
+                    error[0] = e;
+                }
+            }, "yt-next");
+            final Thread metadataThread = new Thread(() -> {
+                fetchWebClientMetadataAndSetThumbnails(
+                        reqLocalization, reqContentCountry, reqVideoId);
+            }, "yt-web-metadata");
+            nextThread.start();
+            metadataThread.start();
+            try {
+                nextThread.join();
+            } catch (final InterruptedException e) {
+                nextThread.interrupt();
+                metadataThread.interrupt();
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while fetching YouTube next/metadata", e);
+            }
+            // Don't block on metadata — it's only for thumbnails/microformat enhancement.
+            // If it finishes before NEXT, great; if not, the fallback values are used.
+            if (error[0] instanceof IOException) {
+                throw (IOException) error[0];
+            }
+            if (error[0] instanceof ExtractionException) {
+                throw (ExtractionException) error[0];
+            }
+            if (error[0] instanceof RuntimeException) {
+                throw (RuntimeException) error[0];
+            }
+            if (error[0] instanceof Error) {
+                throw (Error) error[0];
+            }
+            if (error[0] != null) {
+                throw new IOException("Failed to fetch YouTube next response", error[0]);
+            }
+            nextResponse = next[0];
+            // Prefetch continues in the background; getItags' ensureClientForStreams will
+            // awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
         }
-        final List<Thread> prefetch = prefetchRemainingClients(mainClient);
-        joinPrefetch(prefetch);
     }
 
     @Nonnull
@@ -1066,10 +1124,16 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         switch (authScene()) {
             case PREMIUM:
             case LOGGED_IN:
-                return List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
+                // WEB first for full metadata + adaptive streams (PoToken is available when
+                // logged in); ANDROID_VR as a jsless PoToken-free fallback; TVHTML5 as a
+                // PoToken-free fallback for age-gated / made-for-kids videos.
+                return List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
             case ANON:
             default:
-                return List.of(Client.ANDROID_VR, Client.ANDROID, Client.WEB);
+                // ANDROID_VR is jsless and PoToken-free — ideal primary for anonymous requests.
+                // WEB provides HLS/progressive formats and full metadata. TVHTML5 is a
+                // PoToken-free fallback for videos unplayable on ANDROID_VR (age-gate, kids).
+                return List.of(Client.ANDROID_VR, Client.WEB, Client.TVHTML5);
         }
     }
 
@@ -1085,13 +1149,15 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 case PREMIUM:
                 case LOGGED_IN:
                     return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR, Client.ANDROID)
-                            : List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
+                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR,
+                                    Client.TVHTML5)
+                            : List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
                 case ANON:
                 default:
                     return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR, Client.ANDROID)
-                            : List.of(Client.WEB, Client.ANDROID_VR, Client.ANDROID);
+                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR,
+                                    Client.TVHTML5)
+                            : List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
             }
         }
         return buildClients();
@@ -1407,6 +1473,54 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         state.fetched = true;
     }
 
+    private void fetchTvHtml5Client(@Nonnull final Client client,
+                                    @Nonnull final Localization localization,
+                                    @Nonnull final ContentCountry contentCountry,
+                                    @Nonnull final String videoId)
+            throws IOException, ExtractionException {
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = generateContentPlaybackNonce();
+
+        playerResponse = YoutubeStreamHelper.getTvHtml5PlayerResponse(
+                contentCountry, localization, videoId, state.contentPlaybackNonce);
+
+        checkPlayabilityStatus(playerResponse.getObject(PLAYABILITY_STATUS));
+        if (isPlayerResponseNotValid(playerResponse, videoId)) {
+            throw new ExtractionException("TVHTML5 player response is not valid");
+        }
+
+        state.streamingData = playerResponse.getObject(STREAMING_DATA);
+
+        if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
+            playerCaptionsTracklistRenderer = playerResponse.getObject(CAPTIONS)
+                    .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
+        }
+        state.fetched = true;
+    }
+
+    private void prefetchTvHtml5Client(@Nonnull final Client client,
+                                       @Nonnull final Localization localization,
+                                       @Nonnull final ContentCountry contentCountry,
+                                       @Nonnull final String videoId)
+            throws IOException, ExtractionException {
+        final String cpn = generateContentPlaybackNonce();
+        final JsonObject tvPlayerResponse = YoutubeStreamHelper.getTvHtml5PlayerResponse(
+                contentCountry, localization, videoId, cpn);
+
+        if (isPlayerResponseNotValid(tvPlayerResponse, videoId)) {
+            throw new ExtractionException("TVHTML5 player response is not valid");
+        }
+
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = cpn;
+        state.streamingData = tvPlayerResponse.getObject(STREAMING_DATA);
+        if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
+            playerCaptionsTracklistRenderer = tvPlayerResponse.getObject(CAPTIONS)
+                    .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
+        }
+        state.fetched = true;
+    }
+
     private void fetchWebClientMetadataAndSetThumbnails(
             @Nonnull final Localization localization,
             @Nonnull final ContentCountry contentCountry,
@@ -1487,6 +1601,9 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                     fetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken,
                             required);
                     break;
+                case TVHTML5:
+                    fetchTvHtml5Client(client, reqLocalization, reqContentCountry, reqVideoId);
+                    break;
                 default:
                     throw new ExtractionException("Unsupported client");
             }
@@ -1521,6 +1638,9 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             case IOS:
                 prefetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken);
                 break;
+            case TVHTML5:
+                prefetchTvHtml5Client(client, reqLocalization, reqContentCountry, reqVideoId);
+                break;
             default:
                 throw new ExtractionException("Unsupported client");
         }
@@ -1538,8 +1658,13 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                     prefetchClient(client);
                 } catch (final IOException | ExtractionException e) {
                     resetClient(client);
+                } finally {
+                    // Detach the thread reference once the prefetch is done so later
+                    // ensureClient* callers know there is nothing left to join.
+                    clientState(client).prefetchThread = null;
                 }
             }, "yt-client-" + client.name().toLowerCase(Locale.ROOT));
+            clientState(client).prefetchThread = thread;
             thread.start();
             threads.add(thread);
         }
@@ -1557,11 +1682,34 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             }
         }
     }
+
+    /**
+     * If a background prefetch for {@code client} is still in flight, wait for it to finish.
+     * This lets lazy {@code ensureClient*} callers reuse the in-flight request instead of
+     * issuing a duplicate fetch. After this returns, {@link #isClientFetched} reflects the
+     * prefetch outcome.
+     */
+    private void awaitPrefetch(@Nonnull final Client client) {
+        final Thread thread = clientState(client).prefetchThread;
+        if (thread == null) {
+            return;
+        }
+        try {
+            thread.join();
+        } catch (final InterruptedException e) {
+            thread.interrupt();
+            Thread.currentThread().interrupt();
+        }
+    }
     private void ensureClientForManifest(@Nonnull final Client client,
                                          @Nonnull final String manifestKey) {
         if (!isNullOrEmpty(getManifestFromClient(client, manifestKey))) {
             return;
         }
+        if (isClientFetched(client)) {
+            return;
+        }
+        awaitPrefetch(client);
         if (isClientFetched(client)) {
             return;
         }
@@ -1577,6 +1725,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         if (hasUsableStreams(getStreamingData(client), streamingDataKey, itagTypeWanted)) {
             return;
         }
+        if (isClientFetched(client)) {
+            return;
+        }
+        awaitPrefetch(client);
         if (isClientFetched(client)) {
             return;
         }

@@ -43,6 +43,11 @@ final class YoutubeJavaScriptExtractor {
     /**
      * Extracts the JavaScript base player file.
      *
+     * <p>
+     * Tries the embed watch page first (faster on cold start — no iframe JS execution), falling
+     * back to the IFrame resource if that fails. The result is cached by
+     * {@link YoutubeJavaScriptPlayerManager} so this is only slow once per app session.
+     *
      * @param videoId the video ID used to get the JavaScript base player file (an empty one can be
      *                passed, even it is not recommend in order to spoof better official YouTube
      *                clients)
@@ -54,7 +59,7 @@ final class YoutubeJavaScriptExtractor {
             throws ParsingException {
         String url;
         try {
-            url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithIframeResource();
+            url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithEmbedWatchPage(videoId);
             final String playerJsUrl = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
 
             // Assert that the URL we extracted and built is valid
@@ -62,7 +67,7 @@ final class YoutubeJavaScriptExtractor {
 
             return YoutubeJavaScriptExtractor.downloadJavaScriptCode(playerJsUrl);
         } catch (final Exception e) {
-            url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithEmbedWatchPage(videoId);
+            url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithIframeResource();
             final String playerJsUrl = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
 
             try {

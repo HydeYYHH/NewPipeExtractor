@@ -18,6 +18,7 @@ import java.util.Map;
 
 import static org.schabi.newpipe.extractor.NewPipe.getDownloader;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_VR_USER_AGENT;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_USER_AGENT;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_EMBEDDED_CLIENT_ID;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_EMBEDDED_CLIENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.CONTENT_CHECK_OK;
@@ -289,6 +290,51 @@ public final class YoutubeStreamHelper {
         if (iosPoTokenResult != null) {
             addPoToken(builder, iosPoTokenResult.playerRequestPoToken);
         }
+
+        final byte[] body = JsonWriter.string(builder.done())
+                .getBytes(StandardCharsets.UTF_8);
+
+        final String url = YOUTUBEI_V1_GAPIS_URL + PLAYER + "?" + DISABLE_PRETTY_PRINT_PARAMETER
+                + "&t=" + generateTParameter() + "&id=" + videoId;
+
+        return JsonUtils.toJsonObject(getValidJsonResponseBody(
+                getDownloader().postWithContentTypeJson(url, headers, body, localization)));
+    }
+
+    /**
+     * Gets the player response of a video using the {@code TVHTML5} client.
+     *
+     * <p>
+     * This client is used as a PoToken-free fallback for videos that are unplayable on the
+     * {@code ANDROID_VR} or {@code WEB} clients (e.g. age-gated or "made for kids" videos). Like
+     * the {@code ANDROID_VR} client, it does not require a JavaScript player or a PoToken.
+     * </p>
+     *
+     * @param contentCountry the content country
+     * @param localization   the localization
+     * @param videoId        the video id
+     * @param cpn            the content playback nonce
+     * @return the player response as a {@link JsonObject}
+     */
+    @Nonnull
+    public static JsonObject getTvHtml5PlayerResponse(
+            @Nonnull final ContentCountry contentCountry,
+            @Nonnull final Localization localization,
+            @Nonnull final String videoId,
+            @Nonnull final String cpn) throws IOException, ExtractionException {
+        final InnertubeClientRequestInfo innertubeClientRequestInfo =
+                InnertubeClientRequestInfo.ofTvHtml5Client();
+
+        final Map<String, List<String>> headers = getMobileClientHeaders(TVHTML5_USER_AGENT);
+
+        innertubeClientRequestInfo.clientInfo.visitorData =
+                YoutubeParsingHelper.getVisitorDataFromInnertube(innertubeClientRequestInfo,
+                        localization, contentCountry, headers, YOUTUBEI_V1_GAPIS_URL, null, false);
+
+        final JsonBuilder<JsonObject> builder = prepareJsonBuilder(localization, contentCountry,
+                innertubeClientRequestInfo, null);
+
+        addVideoIdCpnAndOkChecks(builder, videoId, cpn);
 
         final byte[] body = JsonWriter.string(builder.done())
                 .getBytes(StandardCharsets.UTF_8);

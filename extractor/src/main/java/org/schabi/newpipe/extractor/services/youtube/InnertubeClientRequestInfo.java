@@ -17,6 +17,9 @@ import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_DEVICE_MODEL;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_OS_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.MOBILE_CLIENT_PLATFORM;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_CLIENT_ID;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_CLIENT_NAME;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_CLIENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WATCH_CLIENT_SCREEN;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_ID;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_NAME;
@@ -154,5 +157,14 @@ public final class InnertubeClientRequestInfo {
                         IOS_CLIENT_ID, WATCH_CLIENT_SCREEN, null),
                 new InnertubeClientRequestInfo.DeviceInfo(MOBILE_CLIENT_PLATFORM, "Apple",
                         IOS_DEVICE_MODEL, "iOS", IOS_OS_VERSION, -1));
+    }
+
+    @Nonnull
+    public static InnertubeClientRequestInfo ofTvHtml5Client() {
+        return new InnertubeClientRequestInfo(
+                new InnertubeClientRequestInfo.ClientInfo(TVHTML5_CLIENT_NAME,
+                        TVHTML5_CLIENT_VERSION, TVHTML5_CLIENT_ID, WATCH_CLIENT_SCREEN, null),
+                new InnertubeClientRequestInfo.DeviceInfo("TV", null, null,
+                        null, null, -1));
     }
 }

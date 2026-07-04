@@ -73,6 +73,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -83,6 +84,37 @@ import javax.annotation.Nullable;
 public final class YoutubeParsingHelper {
 
     private YoutubeParsingHelper() {
+    }
+
+    /**
+     * Cached visitorData, shared across all client fetches and all InnerTube hosts within its TTL.
+     * YouTube returns the same value for a given IP/session for ~6 hours regardless of which
+     * InnerTube host (www.youtube.com vs youtubei.googleapis.com) is queried, so caching for 10
+     * minutes eliminates the 10+ redundant visitor_id pings NewPipe would otherwise make per
+     * extraction (previously: one per client × multiple hosts = 11+ requests).
+     */
+    @Nullable
+    private static volatile String cachedVisitorId;
+    private static volatile long visitorIdExpiresAtMs;
+    private static final long VISITOR_ID_TTL_MS = TimeUnit.MINUTES.toMillis(10);
+
+    /**
+     * Pre-fetches and caches visitorData so the first extraction doesn't pay the ~500ms DNS+TLS
+     * penalty on the googleapis.com host. Call this from a background thread at app startup.
+     */
+    public static void warmUpVisitorDataCache() {
+        try {
+            getVisitorDataFromInnertube(
+                    InnertubeClientRequestInfo.ofWebClient(),
+                    Localization.DEFAULT,
+                    ContentCountry.DEFAULT,
+                    getYouTubeHeaders(),
+                    YOUTUBEI_V1_URL,
+                    null,
+                    false);
+        } catch (Exception ignored) {
+            // Will be retried on first extraction if warm-up fails.
+        }
     }
 
     /**
@@ -1475,6 +1507,12 @@ public final class YoutubeParsingHelper {
             @Nonnull final String innertubeDomainAndVersionEndpoint,
             @Nullable final String embedUrl,
             final boolean useGuideEndpoint) throws IOException, ExtractionException {
+        // Return cached visitorData if still valid — avoids 10+ redundant visitor_id pings.
+        final String cached = cachedVisitorId;
+        if (cached != null && System.currentTimeMillis() < visitorIdExpiresAtMs) {
+            return cached;
+        }
+
         final JsonBuilder<JsonObject> builder = prepareJsonBuilder(
                 localization, contentCountry, innertubeClientRequestInfo, embedUrl);
 
@@ -1493,6 +1531,10 @@ public final class YoutubeParsingHelper {
         if (isNullOrEmpty(visitorData)) {
             throw new ParsingException("Could not get visitorData");
         }
+
+        // Cache for subsequent calls within the TTL window.
+        cachedVisitorId = visitorData;
+        visitorIdExpiresAtMs = System.currentTimeMillis() + VISITOR_ID_TTL_MS;
 
         return visitorData;
     }

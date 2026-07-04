@@ -12,7 +12,7 @@ val onJitPack = !System.getenv("JITPACK").isNullOrEmpty()
 allprojects {
     apply(plugin = "java-library")
 
-    version = "v0.26.0-hyde3"
+    version = "v0.26.0-aria"
 
     tasks.withType<JavaCompile> {
         options.encoding = Charsets.UTF_8.toString()

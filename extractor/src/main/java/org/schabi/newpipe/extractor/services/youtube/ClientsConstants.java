@@ -118,4 +118,12 @@ final class ClientsConstants {
     static final String ANDROID_VR_USER_AGENT =
             "com.google.android.apps.youtube.vr.oculus/1.65.10 "
                     + "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+
+    // TVHTML5 (YouTube on smart TVs / game consoles), a PoToken-free fallback client.
+
+    static final String TVHTML5_CLIENT_ID = "7";
+    static final String TVHTML5_CLIENT_NAME = "TVHTML5";
+    static final String TVHTML5_CLIENT_VERSION = "7.20260120.13.00";
+    static final String TVHTML5_USER_AGENT =
+            "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
 }
