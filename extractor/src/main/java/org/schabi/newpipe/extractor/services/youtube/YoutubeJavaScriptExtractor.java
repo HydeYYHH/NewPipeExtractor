@@ -10,6 +10,7 @@ import org.schabi.newpipe.extractor.localization.Localization;
 import org.schabi.newpipe.extractor.utils.Parser;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.regex.Pattern;
@@ -42,6 +43,8 @@ final class YoutubeJavaScriptExtractor {
 
     /**
      * Extracts the JavaScript base player file.
+     * Prefers the embed watch page (cheaper cold start), then falls back to the IFrame resource.
+     * Cached by {@link YoutubeJavaScriptPlayerManager} for the process lifetime.
      *
      * <p>
      * Tries the embed watch page first (faster on cold start — no iframe JS execution), falling
@@ -57,28 +60,62 @@ final class YoutubeJavaScriptExtractor {
     @Nonnull
     static String extractJavaScriptPlayerCode(@Nonnull final String videoId)
             throws ParsingException {
+        return extractJavaScriptPlayerCode(videoId, null);
+    }
+
+    /**
+     * Extracts the JavaScript base player file, optionally from an explicit
+     * player JS URL.
+     *
+     * <p>Player builds rotate frequently and a build's cipher constants only
+     * decipher signatures minted for it, so callers that know which build
+     * produced the bodies they decipher (e.g. a WebView session reporting its
+     * {@code PLAYER_JS_URL}) must pass that URL here. A failing explicit URL is
+     * NOT silently retried with the embed page discovery: that would decipher
+     * with mismatched constants and produce garbage signatures.</p>
+     *
+     * @param videoId     video id used to locate the player JS when no URL is given
+     * @param playerJsUrl the player JS URL to use, or {@code null} for discovery
+     * @return the full player JS source
+     * @throws ParsingException if extraction failed
+     */
+    @Nonnull
+    static String extractJavaScriptPlayerCode(@Nonnull final String videoId,
+                                              @Nullable final String playerJsUrl)
+            throws ParsingException {
+        if (playerJsUrl != null && playerJsUrl.contains("/s/player/")) {
+            final String playerJsUrl2 = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(playerJsUrl);
+            try {
+                // Assert that the URL we extracted and built is valid
+                new URL(playerJsUrl2);
+            } catch (final MalformedURLException exception) {
+                throw new ParsingException(
+                        "The extracted and built JavaScript URL is invalid", exception);
+            }
+            return YoutubeJavaScriptExtractor.downloadJavaScriptCode(playerJsUrl2);
+        }
         String url;
         try {
             url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithEmbedWatchPage(videoId);
-            final String playerJsUrl = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
+            final String playerJsUrlClean = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
 
             // Assert that the URL we extracted and built is valid
-            new URL(playerJsUrl);
+            new URL(playerJsUrlClean);
 
-            return YoutubeJavaScriptExtractor.downloadJavaScriptCode(playerJsUrl);
+            return YoutubeJavaScriptExtractor.downloadJavaScriptCode(playerJsUrlClean);
         } catch (final Exception e) {
             url = YoutubeJavaScriptExtractor.extractJavaScriptUrlWithIframeResource();
-            final String playerJsUrl = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
+            final String iframeJsUrlClean = YoutubeJavaScriptExtractor.cleanJavaScriptUrl(url);
 
             try {
                 // Assert that the URL we extracted and built is valid
-                new URL(playerJsUrl);
+                new URL(iframeJsUrlClean);
             } catch (final MalformedURLException exception) {
                 throw new ParsingException(
                         "The extracted and built JavaScript URL is invalid", exception);
             }
 
-            return YoutubeJavaScriptExtractor.downloadJavaScriptCode(playerJsUrl);
+            return YoutubeJavaScriptExtractor.downloadJavaScriptCode(iframeJsUrlClean);
         }
     }
 

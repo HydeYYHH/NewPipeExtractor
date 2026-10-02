@@ -43,7 +43,13 @@ public final class Utils {
      * @return The decoded URL.
      */
     public static String decodeUrlUtf8(final String url) {
-        return URLDecoder.decode(url, StandardCharsets.UTF_8);
+        // Use the String-charset overload (API 1+) instead of URLDecoder.decode(String, Charset)
+        // which only exists on Android API 33+ / Java 10+ and throws NoSuchMethodError below that.
+        try {
+            return URLDecoder.decode(url, "UTF-8");
+        } catch (final java.io.UnsupportedEncodingException e) {
+            throw new AssertionError("UTF-8 not supported", e);
+        }
     }
 
     /**

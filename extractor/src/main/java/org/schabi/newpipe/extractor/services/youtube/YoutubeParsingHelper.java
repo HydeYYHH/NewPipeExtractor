@@ -22,10 +22,15 @@ package org.schabi.newpipe.extractor.services.youtube;
 
 import static org.schabi.newpipe.extractor.NewPipe.getDownloader;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_CLIENT_VERSION;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.ANDROID_VR_USER_AGENT;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.DESKTOP_CLIENT_PLATFORM;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_USER_AGENT;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_CLIENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_DEVICE_MODEL;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_USER_AGENT_VERSION;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.VISIONOS_CLIENT_VERSION;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.VISIONOS_DEVICE_MODEL;
+import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.VISIONOS_USER_AGENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_ID;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_NAME;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_HARDCODED_CLIENT_VERSION;
@@ -99,10 +104,11 @@ public final class YoutubeParsingHelper {
     private static final long VISITOR_ID_TTL_MS = TimeUnit.MINUTES.toMillis(10);
 
     /**
-     * Pre-fetches and caches visitorData so the first extraction doesn't pay the ~500ms DNS+TLS
-     * penalty on the googleapis.com host. Call this from a background thread at app startup.
+     * Initializes {@link #cachedVisitorId} early (for example at app startup).
+     *
+     * <p>Failures are ignored; the next extract retries.
      */
-    public static void warmUpVisitorDataCache() {
+    public static void initializeVisitorDataCache() {
         try {
             getVisitorDataFromInnertube(
                     InnertubeClientRequestInfo.ofWebClient(),
@@ -112,8 +118,8 @@ public final class YoutubeParsingHelper {
                     YOUTUBEI_V1_URL,
                     null,
                     false);
-        } catch (Exception ignored) {
-            // Will be retried on first extraction if warm-up fails.
+        } catch (final Exception ignored) {
+            // Retry on first extraction.
         }
     }
 
@@ -209,8 +215,12 @@ public final class YoutubeParsingHelper {
     private static final Pattern C_WEB_PATTERN = Pattern.compile("&c=WEB");
     private static final Pattern C_WEB_EMBEDDED_PLAYER_PATTERN =
             Pattern.compile("&c=WEB_EMBEDDED_PLAYER");
-    private static final Pattern C_ANDROID_PATTERN = Pattern.compile("&c=ANDROID");
+    private static final Pattern C_ANDROID_VR_PATTERN = Pattern.compile("&c=ANDROID_VR");
+    // Negative lookahead: `&c=ANDROID` must not match `&c=ANDROID_VR`.
+    private static final Pattern C_ANDROID_PATTERN = Pattern.compile("&c=ANDROID(?!_)");
     private static final Pattern C_IOS_PATTERN = Pattern.compile("&c=IOS");
+    private static final Pattern C_TVHTML5_PATTERN = Pattern.compile("&c=TVHTML5");
+    private static final Pattern C_VISIONOS_PATTERN = Pattern.compile("&c=VISIONOS");
 
     private static final Set<String> GOOGLE_URLS = Set.of("google.", "m.google.", "www.google.");
     private static final Set<String> INVIDIOUS_URLS = Set.of("invidio.us", "dev.invidio.us",
@@ -1148,6 +1158,39 @@ public final class YoutubeParsingHelper {
     }
 
     /**
+     * User-Agent used for {@code VISIONOS} InnerTube and googlevideo requests.
+     *
+     * <p>Must match the UA sent when fetching the player response, otherwise
+     * googlevideo 403s.
+     */
+    @Nonnull
+    public static String getVisionOsUserAgent(@Nullable final Localization localization) {
+        return "com.google.visionos.youtube/" + VISIONOS_CLIENT_VERSION + "("
+                + VISIONOS_DEVICE_MODEL + "; U; CPU visionOS " + VISIONOS_USER_AGENT_VERSION
+                + " like Mac OS X; "
+                + (localization != null ? localization : Localization.DEFAULT).getCountryCode()
+                + ")";
+    }
+
+    /**
+     * User-Agent used for {@code ANDROID_VR} InnerTube and googlevideo requests.
+     *
+     * <p>Must match the UA sent when fetching the player response, otherwise googlevideo 403s.
+     */
+    @Nonnull
+    public static String getAndroidVrUserAgent() {
+        return ANDROID_VR_USER_AGENT;
+    }
+
+    /**
+     * User-Agent used for {@code TVHTML5} InnerTube and googlevideo requests.
+     */
+    @Nonnull
+    public static String getTvHtml5UserAgent() {
+        return TVHTML5_USER_AGENT;
+    }
+
+    /**
      * Returns a {@link Map} containing the required YouTube Music headers.
      */
     @Nonnull
@@ -1403,13 +1446,36 @@ public final class YoutubeParsingHelper {
     }
 
     /**
+     * Check if the streaming URL is from the YouTube {@code ANDROID_VR} client.
+     */
+    public static boolean isAndroidVrStreamingUrl(@Nonnull final String url) {
+        return Parser.isMatch(C_ANDROID_VR_PATTERN, url);
+    }
+
+    /**
      * Check if the streaming URL is a URL from the YouTube {@code ANDROID} client.
+     *
+     * <p>Does not match {@code ANDROID_VR}.
      *
      * @param url the streaming URL to be checked.
      * @return true if it's a {@code ANDROID} streaming URL, false otherwise
      */
     public static boolean isAndroidStreamingUrl(@Nonnull final String url) {
         return Parser.isMatch(C_ANDROID_PATTERN, url);
+    }
+
+    /**
+     * Check if the streaming URL is from the YouTube {@code TVHTML5} client.
+     */
+    public static boolean isTvHtml5StreamingUrl(@Nonnull final String url) {
+        return Parser.isMatch(C_TVHTML5_PATTERN, url);
+    }
+
+    /**
+     * Check if the streaming URL is from the YouTube {@code VISIONOS} client.
+     */
+    public static boolean isVisionOsStreamingUrl(@Nonnull final String url) {
+        return Parser.isMatch(C_VISIONOS_PATTERN, url);
     }
 
     /**

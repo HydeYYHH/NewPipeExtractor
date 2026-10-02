@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC
+          "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
+          "https://checkstyle.org/dtds/suppressions_1_2.dtd">
+<suppressions>
+    <!-- Rewrite debt: YoutubeStreamExtractor grew past the file-length limit
+         across hotfixes; splitting it is tracked separately and must not block
+         every test run in the meantime. -->
+    <suppress checks="FileLength"
+              files="extractors[\\/]YoutubeStreamExtractor\.java"/>
+</suppressions>

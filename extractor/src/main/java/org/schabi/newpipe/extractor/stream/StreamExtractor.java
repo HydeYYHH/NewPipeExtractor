@@ -51,8 +51,11 @@ public abstract class StreamExtractor extends Extractor {
 
     public static final int NO_AGE_LIMIT = 0;
     public static final long UNKNOWN_SUBSCRIBER_COUNT = -1;
-    private boolean streamOnlyRequest;
-    private boolean pageFetchedForStreamsOnly;
+
+    /** True while {@link #fetchPageForPlayer()} is running. */
+    private boolean playerRequest;
+    /** True after a successful {@link #fetchPageForPlayer()}. */
+    private boolean pageFetchedForPlayer;
 
     public StreamExtractor(final StreamingService service, final LinkHandler linkHandler) {
         super(service, linkHandler);
@@ -61,31 +64,49 @@ public abstract class StreamExtractor extends Extractor {
     @Override
     public void fetchPage() throws IOException, ExtractionException {
         if (isPageFetched()) {
-            if (pageFetchedForStreamsOnly) {
+            if (pageFetchedForPlayer) {
                 throw new IllegalStateException(
-                        "Page was already fetched for streams only with this extractor");
+                        "Page was already fetched for player only with this extractor");
             }
             return;
         }
         super.fetchPage();
     }
 
-    public void fetchPageForStreams() throws IOException, ExtractionException {
+    /**
+     * Fetches player data only (e.g. YouTube {@code /player}), not {@code /next}.
+     *
+     * <p>Use a separate segment fetch for chapters.
+     */
+    public void fetchPageForPlayer() throws IOException, ExtractionException {
         if (isPageFetched()) {
             return;
         }
 
-        streamOnlyRequest = true;
+        playerRequest = true;
         try {
             super.fetchPage();
-            pageFetchedForStreamsOnly = true;
+            pageFetchedForPlayer = true;
         } finally {
-            streamOnlyRequest = false;
+            playerRequest = false;
         }
     }
 
+    /** @deprecated use {@link #fetchPageForPlayer()} */
+    @Deprecated
+    public void fetchPageForStreams() throws IOException, ExtractionException {
+        fetchPageForPlayer();
+    }
+
+    /** Returns true while {@link #fetchPageForPlayer()} is running. */
+    protected boolean isPlayerRequest() {
+        return playerRequest;
+    }
+
+    /** @deprecated use {@link #isPlayerRequest()} */
+    @Deprecated
     protected boolean isStreamOnlyRequest() {
-        return streamOnlyRequest;
+        return isPlayerRequest();
     }
 
     /**

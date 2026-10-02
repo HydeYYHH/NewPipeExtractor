@@ -1,7 +1,5 @@
 package org.schabi.newpipe.extractor.services.youtube;
 
-import static org.schabi.newpipe.extractor.utils.Parser.matchMultiplePatterns;
-
 import org.schabi.newpipe.extractor.exceptions.ParsingException;
 import org.schabi.newpipe.extractor.utils.JavaScript;
 import org.schabi.newpipe.extractor.utils.Parser;
@@ -9,6 +7,8 @@ import org.schabi.newpipe.extractor.utils.jsextractor.JavaScriptExtractor;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -143,6 +143,24 @@ final class YoutubeThrottlingParameterUtils {
     /**
      * Get the throttling parameter deobfuscation function name of YouTube's base JavaScript file.
      *
+     * <p>
+     * Candidates may be a direct function name or an array reference
+     * ({@code Yva[0]}). Array entries are resolved to the real function name
+     * before {@link #isFunctionNameLikelyDeobfuscation} runs: validating the
+     * array object itself always fails, which used to drop every array-shaped
+     * n-transform.
+     * </p>
+     *
+     * <p>
+     * The first pattern (a generic {@code xxx=function(...) ... return Y[n]}) is
+     * the historical one and is very loose: on current player builds it matches
+     * unrelated helpers (e.g. {@code String.prototype} polyfills), which used to
+     * make deobfuscation silently produce garbage and every WEB/MWEB URL 403.
+     * Every resolved candidate is therefore validated with
+     * {@link #isFunctionNameLikelyDeobfuscation} before use; a candidate that
+     * fails validation is skipped so the tighter patterns can still match.
+     * </p>
+     *
      * @param javaScriptPlayerCode the complete JavaScript base player code
      * @return the name of the throttling parameter deobfuscation function
      * @throws ParsingException if the name of the throttling parameter deobfuscation function
@@ -151,34 +169,144 @@ final class YoutubeThrottlingParameterUtils {
     @Nonnull
     static String getDeobfuscationFunctionName(@Nonnull final String javaScriptPlayerCode)
             throws ParsingException {
-        final Matcher matcher;
-        try {
-            matcher = matchMultiplePatterns(DEOBFUSCATION_FUNCTION_NAME_REGEXES,
-                    javaScriptPlayerCode);
-        } catch (final Parser.RegexException e) {
+        final List<String> seenKeys = new ArrayList<>();
+        final List<String> names = new ArrayList<>();
+        final List<String> indexes = new ArrayList<>();
+        for (final Pattern pattern : DEOBFUSCATION_FUNCTION_NAME_REGEXES) {
+            final Matcher matcher = pattern.matcher(javaScriptPlayerCode);
+            while (matcher.find()) {
+                final String name = matcher.group(1);
+                if (name == null) {
+                    continue;
+                }
+                final String index = matcher.groupCount() >= 2 ? matcher.group(2) : null;
+                final String key = index == null ? name : name + "[" + index + "]";
+                if (seenKeys.contains(key)) {
+                    continue;
+                }
+                seenKeys.add(key);
+                names.add(name);
+                indexes.add(index);
+            }
+        }
+        if (names.isEmpty()) {
             throw new ParsingException("Could not find deobfuscation function with any of the "
-                    + "known patterns in the base JavaScript player code", e);
+                    + "known patterns in the base JavaScript player code");
         }
 
-        final String functionName = matcher.group(1);
-        if (matcher.groupCount() == 1) {
-            return functionName;
+        final List<String> resolvedTried = new ArrayList<>();
+        for (int i = 0; i < names.size(); i++) {
+            final String resolved = resolveFunctionName(
+                    javaScriptPlayerCode, names.get(i), indexes.get(i));
+            if (resolved == null) {
+                continue;
+            }
+            if (!resolvedTried.contains(resolved)) {
+                resolvedTried.add(resolved);
+            }
+            if (!isFunctionNameLikelyDeobfuscation(javaScriptPlayerCode, resolved)) {
+                continue;
+            }
+            return resolved;
         }
+        throw new ParsingException("Deobfuscation function candidates found ("
+                + String.join(", ", seenKeys) + ") resolved to ("
+                + String.join(", ", resolvedTried) + ") but none looks like an array-transform "
+                + "deobfuscation function; the player code likely changed again");
+    }
 
-        final int arrayNum = Integer.parseInt(matcher.group(2));
-        final Pattern arrayPattern = Pattern.compile(
-                DEOBFUSCATION_FUNCTION_ARRAY_OBJECT_TYPE_DECLARATION_REGEX
-                        + Pattern.quote(functionName)
-                        + FUNCTION_NAMES_IN_DEOBFUSCATION_ARRAY_REGEX);
-        final String arrayStr = Parser.matchGroup1(arrayPattern, javaScriptPlayerCode);
-        final String[] names = arrayStr.split(",");
-        return names[arrayNum];
+    /**
+     * Turns an array reference ({@code Yva} + index {@code 0}) into the
+     * function name stored at that slot ({@code Fn}). Direct names are
+     * returned unchanged.
+     *
+     * @param javaScriptPlayerCode the complete JavaScript base player code
+     * @param name an identifier or the array object that holds function names
+     * @param arrayIndex slot in that array, or {@code null} for a direct name
+     * @return the resolved function name, or {@code null} if the array
+     * declaration cannot be parsed or the index is out of range
+     */
+    @Nullable
+    static String resolveFunctionName(@Nonnull final String javaScriptPlayerCode,
+                                      @Nonnull final String name,
+                                      @Nullable final String arrayIndex) {
+        if (arrayIndex == null) {
+            return name;
+        }
+        final int index;
+        try {
+            index = Integer.parseInt(arrayIndex);
+        } catch (final NumberFormatException e) {
+            return null;
+        }
+        if (index < 0) {
+            return null;
+        }
+        try {
+            final Pattern arrayPattern = Pattern.compile(
+                    DEOBFUSCATION_FUNCTION_ARRAY_OBJECT_TYPE_DECLARATION_REGEX
+                            + Pattern.quote(name)
+                            + FUNCTION_NAMES_IN_DEOBFUSCATION_ARRAY_REGEX);
+            final String array = Parser.matchGroup1(arrayPattern, javaScriptPlayerCode);
+            final String[] functionNames = array.split(",");
+            if (index >= functionNames.length) {
+                return null;
+            }
+            final String resolved = functionNames[index].trim();
+            if (resolved.isEmpty()) {
+                return null;
+            }
+            return resolved;
+        } catch (final Parser.RegexException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Heuristic check that {@code functionName} really refers to the n-parameter
+     * deobfuscation function: its body must combine string/array operations that
+     * every known variant uses ({@code split} + {@code join}/index access and at
+     * least one array-mutation helper such as {@code splice}, {@code reverse},
+     * {@code unshift} or {@code push}), must be small enough to be a standalone
+     * function rather than a big framework helper, and must not touch object
+     * properties — the n transform works purely on its string argument, while
+     * helpers that also satisfy the string/array shape (e.g. the avatar
+     * {@code userDisplayImage} URL resizer on 2026-08 player builds) do not.
+     */
+    private static boolean isFunctionNameLikelyDeobfuscation(
+            @Nonnull final String javaScriptPlayerCode, @Nonnull final String functionName) {
+        String function;
+        try {
+            function = parseFunctionWithLexer(javaScriptPlayerCode, functionName);
+        } catch (final Exception ignored) {
+            try {
+                function = parseFunctionWithRegex(javaScriptPlayerCode, functionName);
+            } catch (final Exception alsoIgnored) {
+                return false;
+            }
+        }
+        return looksLikeDeobfuscationBody(function);
+    }
+
+    private static boolean looksLikeDeobfuscationBody(@Nonnull final String function) {
+        if (function.length() > 20_000) {
+            return false;
+        }
+        if (function.contains("userDisplayImage")) {
+            return false;
+        }
+        return function.contains("split")
+                && (function.contains("join") || function.contains("[0]")
+                        || function.contains("length"))
+                && (function.contains("splice") || function.contains("reverse")
+                        || function.contains("unshift") || function.contains("push"));
     }
 
     /**
      * Get the throttling parameter deobfuscation code of YouTube's base JavaScript file.
      *
      * @param javaScriptPlayerCode the complete JavaScript base player code
+     * @param functionName the deobfuscation function name resolved from the player code
      * @return the throttling parameter deobfuscation function code
      * @throws ParsingException if the throttling parameter deobfuscation code couldn't be
      * extracted

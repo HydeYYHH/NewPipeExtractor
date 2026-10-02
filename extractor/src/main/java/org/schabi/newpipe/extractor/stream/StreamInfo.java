@@ -30,8 +30,9 @@ import org.schabi.newpipe.extractor.StreamingService;
 import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException;
 import org.schabi.newpipe.extractor.exceptions.ContentNotSupportedException;
 import org.schabi.newpipe.extractor.exceptions.ExtractionException;
+import org.schabi.newpipe.extractor.exceptions.ParsingException;
 import org.schabi.newpipe.extractor.localization.DateWrapper;
-import org.schabi.newpipe.extractor.utils.ExtractorHelper;
+import org.schabi.newpipe.extractor.services.youtube.extractors.YoutubeStreamExtractor;
 import org.schabi.newpipe.extractor.utils.ExtractorLogger;
 
 import java.io.IOException;
@@ -91,35 +92,53 @@ public class StreamInfo extends Info {
         return getInfo(service.getStreamExtractor(url));
     }
 
-    public static StreamInfo getStream(@Nonnull final StreamingService service,
-                                       final String url) throws IOException, ExtractionException {
-        return getStream(service.getStreamExtractor(url));
-    }
-
+    /**
+     * Fetches via the player request only (YouTube: Innertube {@code /player}).
+     *
+     * <p>Does not call {@code /next}. Use {@link #getSegments(StreamExtractor)} for chapters.
+     */
     public static StreamInfo getInfo(@Nonnull final StreamExtractor extractor)
             throws ExtractionException, IOException {
-        ExtractorLogger.d(TAG, "getInfo({extractor})", extractor);
-        return getStreamInfo(extractor, false);
+        ExtractorLogger.d(TAG, "getInfo player-request {extractor}", extractor);
+        return getStreamInfo(extractor, /* playerOnly= */ true);
     }
 
-    public static StreamInfo getStream(@Nonnull final StreamExtractor extractor)
+    /**
+     * Fetches chapters via {@code /next} only (no {@code /player}).
+     *
+     * @return segments, or empty if the video has no chapters
+     */
+    @Nonnull
+    public static List<StreamSegment> getSegments(@Nonnull final StreamExtractor extractor)
             throws ExtractionException, IOException {
-        return getStreamInfo(extractor, true);
+        ExtractorLogger.d(TAG, "getSegments next-request {extractor}", extractor);
+        if (!(extractor
+                instanceof YoutubeStreamExtractor)) {
+            throw new ExtractionException(
+                    "getSegments is only implemented for YouTube StreamExtractor");
+        }
+        final YoutubeStreamExtractor yt = (YoutubeStreamExtractor) extractor;
+        yt.fetchNextResponse();
+        try {
+            return yt.getStreamSegments();
+        } catch (final ParsingException e) {
+            throw new ExtractionException("Could not parse stream segments from /next", e);
+        }
     }
 
     private static StreamInfo getStreamInfo(@Nonnull final StreamExtractor extractor,
-                                            final boolean streamOnly)
+                                            final boolean playerOnly)
             throws ExtractionException, IOException {
-        if (streamOnly) {
-            extractor.fetchPageForStreams();
+        if (playerOnly) {
+            extractor.fetchPageForPlayer();
         } else {
             extractor.fetchPage();
         }
         final StreamInfo streamInfo;
         try {
-            streamInfo = extractImportantData(extractor, streamOnly);
-            extractStreams(streamInfo, extractor, streamOnly);
-            if (!streamOnly) {
+            streamInfo = extractImportantData(extractor, playerOnly);
+            extractStreams(streamInfo, extractor, playerOnly);
+            if (!playerOnly) {
                 extractOptionalData(streamInfo, extractor);
             }
             return streamInfo;
@@ -139,7 +158,7 @@ public class StreamInfo extends Info {
 
     @Nonnull
     private static StreamInfo extractImportantData(@Nonnull final StreamExtractor extractor,
-                                                   final boolean streamOnly)
+                                                   final boolean playerOnly)
             throws ExtractionException, IOException {
         // Important data, without it the content can't be displayed.
         // If one of these is not available, the frontend will receive an exception directly.
@@ -148,7 +167,7 @@ public class StreamInfo extends Info {
         final StreamType streamType = extractor.getStreamType();
         final String id = extractor.getId();
         final String name = extractor.getName();
-        final int ageLimit = streamOnly ? StreamExtractor.NO_AGE_LIMIT : extractor.getAgeLimit();
+        final int ageLimit = playerOnly ? StreamExtractor.NO_AGE_LIMIT : extractor.getAgeLimit();
 
         // Suppress always-non-null warning as here we double-check it really is not null
         //noinspection ConstantConditions
@@ -167,7 +186,7 @@ public class StreamInfo extends Info {
 
     private static void extractStreams(final StreamInfo streamInfo,
                                        final StreamExtractor extractor,
-                                       final boolean streamOnly)
+                                       final boolean playerOnly)
             throws ExtractionException, InterruptedIOException {
         /* ---- Stream extraction goes here ---- */
         // At least one type of stream has to be available, otherwise an exception will be thrown

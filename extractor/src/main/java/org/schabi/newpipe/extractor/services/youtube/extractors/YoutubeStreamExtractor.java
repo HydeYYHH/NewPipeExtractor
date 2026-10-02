@@ -94,10 +94,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -105,13 +107,11 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class YoutubeStreamExtractor extends StreamExtractor {
-    private enum Client { ANDROID_VR, ANDROID, WEB, IOS, TVHTML5 }
+    private enum Client { ANDROID_VR, ANDROID, WEB, IOS, TVHTML5, VISIONOS }
 
     private enum ManifestKind { DASH, HLS }
 
     private enum StreamChoiceKind { AUDIO, VIDEO_ONLY, MUXED }
-
-    private enum AuthScene { ANON, LOGGED_IN, PREMIUM }
 
     private static final class ClientState {
         @Nullable
@@ -124,7 +124,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         /**
          * Background prefetch thread started by {@link #prefetchRemainingClients}. Cleared once
          * the prefetch completes (successfully or not). {@link #awaitPrefetch} joins it so that
-         * lazy {@code ensureClient*} callers reuse the in-flight request instead of re-fetching.
+         * lazy {@code resolveClient*} callers reuse the in-flight request instead of re-fetching.
          */
         @Nullable
         private Thread prefetchThread;
@@ -136,12 +136,6 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             fetched = false;
             prefetchThread = null;
         }
-    }
-
-    public interface ClientProfileProvider {
-        boolean isLoggedIn();
-
-        boolean isPremium();
     }
 
     private static final String PREMIERED = "Premiered ";
@@ -163,8 +157,18 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
     @Nullable
     private static PoTokenProvider poTokenProvider;
-    @Nullable
-    private static ClientProfileProvider clientProfileProvider;
+    /**
+     * Player-client trial order ({@link Client} values in process).
+     *
+     * <p>On required-client success the client moves to the front
+     * ({@link #promoteClient(Client)}). {@link #applyClientOrder(List)} merges
+     * this list into a scene default. Apps persist names via
+     * {@link #setClientOrder(List)} / {@link #getClientOrder()}.
+     */
+    @Nonnull
+    private static volatile List<Client> clientOrder = List.of();
+    /** Lock for {@link #clientOrder}. */
+    private static final Object CLIENT_ORDER_LOCK = new Object();
     private static boolean fetchIosClient = true;
 
     private JsonObject playerResponse;
@@ -204,8 +208,9 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     @Nullable
     private PoTokenResult reqWebPoToken;
     private boolean webPoTokenKnown;
+    private boolean iosPoTokenKnown;
     @Nonnull
-    private List<Client> clients = List.of(Client.ANDROID_VR, Client.WEB, Client.TVHTML5);
+    private List<Client> clients = List.of(Client.ANDROID, Client.WEB, Client.TVHTML5);
 
     public YoutubeStreamExtractor(final StreamingService service, final LinkHandler linkHandler) {
         super(service, linkHandler);
@@ -733,7 +738,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 ? "dashManifestUrl" : "hlsManifestUrl";
         final List<ManifestChoice> candidates = new ArrayList<>();
         for (final Client client : clients) {
-            ensureClientForManifest(client, manifestKey);
+            resolveClientForManifest(client, manifestKey);
             final Pair<JsonObject, String> pair = getStreamingDataPair(client);
             final JsonObject data = pair.getFirst();
             if (data == null) {
@@ -960,7 +965,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         reqAndroidPoToken = noPo ? null : provider.getAndroidClientPoToken(reqVideoId);
         reqWebPoToken = null;
         webPoTokenKnown = noPo;
-        reqIosPoToken = !fetchIosClient || noPo ? null : provider.getIosClientPoToken(reqVideoId);
+        // Minted lazily in the IOS fetch/prefetch paths so the player request
+        // is not blocked on a WebView token mint before WEB is even tried.
+        reqIosPoToken = null;
+        iosPoTokenKnown = noPo;
         dashChoices = new ArrayList<>();
         hlsChoices = new ArrayList<>();
         audioChoices = new ArrayList<>();
@@ -999,13 +1007,31 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         }
 
         setStreamType();
+        // Player path skips /next; chapters use fetchNextResponse().
+        prefetchRemainingClients(mainClient);
+        setMetadataFromPlayerResponse(playerResponse);
+    }
 
-        if (isStreamOnlyRequest()) {
-            final List<Thread> prefetch = prefetchRemainingClients(mainClient);
-            joinPrefetch(prefetch);
+    /**
+     * Issues Innertube {@code /next} for chapters only (no {@code /player}).
+     *
+     * <p>Use {@link #fetchPageForPlayer()} /
+     * {@link org.schabi.newpipe.extractor.stream.StreamInfo#getInfo}
+     * for streams.
+     */
+    public void fetchNextResponse() throws IOException, ExtractionException {
+        if (nextResponse != null) {
             return;
         }
-
+        if (reqVideoId == null) {
+            reqVideoId = getId();
+        }
+        if (reqLocalization == null) {
+            reqLocalization = getExtractorLocalization();
+        }
+        if (reqContentCountry == null) {
+            reqContentCountry = getExtractorContentCountry();
+        }
         final byte[] nextBody = JsonWriter.string(
                 prepareDesktopJsonBuilder(reqLocalization, reqContentCountry)
                         .value(VIDEO_ID, reqVideoId)
@@ -1013,98 +1039,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                         .value(RACY_CHECK_OK, true)
                         .done())
                 .getBytes(StandardCharsets.UTF_8);
-        if (mainClient == Client.WEB) {
-            // Kick off the remaining clients' prefetch as early as possible so it overlaps with
-            // NEXT and metadata extraction. We do NOT join here: getItags' ensureClientForStreams
-            // will awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
-            prefetchRemainingClients(mainClient);
-            // Parallelize NEXT with metadata extraction to avoid the ~1s sequential penalty.
-            final JsonObject[] next = new JsonObject[1];
-            final Throwable[] error = new Throwable[1];
-            final Thread nextThread = new Thread(() -> {
-                try {
-                    next[0] = getJsonPostResponse(NEXT, nextBody, reqLocalization);
-                } catch (final Throwable e) {
-                    error[0] = e;
-                }
-            }, "yt-next");
-            nextThread.start();
-            setMetadataFromPlayerResponse(playerResponse);
-            try {
-                nextThread.join();
-            } catch (final InterruptedException e) {
-                nextThread.interrupt();
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while fetching YouTube next response", e);
-            }
-            if (error[0] instanceof IOException) {
-                throw (IOException) error[0];
-            }
-            if (error[0] instanceof ExtractionException) {
-                throw (ExtractionException) error[0];
-            }
-            if (error[0] instanceof RuntimeException) {
-                throw (RuntimeException) error[0];
-            }
-            if (error[0] instanceof Error) {
-                throw (Error) error[0];
-            }
-            if (error[0] != null) {
-                throw new IOException("Failed to fetch YouTube next response", error[0]);
-            }
-            nextResponse = next[0];
-            // Prefetch continues in the background; getItags' ensureClientForStreams will
-            // awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
-        } else {
-            // Main client is not WEB (e.g. ANDROID_VR). Fetch NEXT and WEB metadata in parallel
-            // so neither blocks the critical path. The WEB metadata call only provides microformat
-            // and better thumbnails — it's not needed for stream extraction.
-            // Start remaining-client prefetch early so it overlaps with NEXT + metadata too.
-            prefetchRemainingClients(mainClient);
-            final JsonObject[] next = new JsonObject[1];
-            final Throwable[] error = new Throwable[1];
-            final Thread nextThread = new Thread(() -> {
-                try {
-                    next[0] = getJsonPostResponse(NEXT, nextBody, reqLocalization);
-                } catch (final Throwable e) {
-                    error[0] = e;
-                }
-            }, "yt-next");
-            final Thread metadataThread = new Thread(() -> {
-                fetchWebClientMetadataAndSetThumbnails(
-                        reqLocalization, reqContentCountry, reqVideoId);
-            }, "yt-web-metadata");
-            nextThread.start();
-            metadataThread.start();
-            try {
-                nextThread.join();
-            } catch (final InterruptedException e) {
-                nextThread.interrupt();
-                metadataThread.interrupt();
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while fetching YouTube next/metadata", e);
-            }
-            // Don't block on metadata — it's only for thumbnails/microformat enhancement.
-            // If it finishes before NEXT, great; if not, the fallback values are used.
-            if (error[0] instanceof IOException) {
-                throw (IOException) error[0];
-            }
-            if (error[0] instanceof ExtractionException) {
-                throw (ExtractionException) error[0];
-            }
-            if (error[0] instanceof RuntimeException) {
-                throw (RuntimeException) error[0];
-            }
-            if (error[0] instanceof Error) {
-                throw (Error) error[0];
-            }
-            if (error[0] != null) {
-                throw new IOException("Failed to fetch YouTube next response", error[0]);
-            }
-            nextResponse = next[0];
-            // Prefetch continues in the background; getItags' ensureClientForStreams will
-            // awaitPrefetch whichever clients it actually needs, reusing the in-flight work.
-        }
+        nextResponse = getJsonPostResponse(NEXT, nextBody, reqLocalization);
     }
 
     @Nonnull
@@ -1118,23 +1053,106 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
     @Nonnull
     private List<Client> baseClientOrder() {
+        final List<Client> defaults;
         if (isLiveScene()) {
-            return List.of(Client.ANDROID, Client.WEB);
+            defaults = List.of(Client.ANDROID, Client.WEB);
+        } else {
+            // As of 2026-08 VISIONOS is the only client whose adaptive formats
+            // still carry direct googlevideo URLs without a poToken AND
+            // without the ~64 s read window that pot-less IOS/ANDROID URLs
+            // are subject to, so it leads every VOD extract. ANDROID follows:
+            // its muxed itag 18 (reel player response) is window-exempt, which
+            // keeps a playable floor if VISIONOS is bot-checked. WEB provides
+            // metadata + captions; TVHTML5 stays as the age-gate / made-for-kids
+            // fallback.
+            defaults = List.of(Client.VISIONOS, Client.ANDROID, Client.WEB, Client.TVHTML5);
         }
-        switch (authScene()) {
-            case PREMIUM:
-            case LOGGED_IN:
-                // WEB first for full metadata + adaptive streams (PoToken is available when
-                // logged in); ANDROID_VR as a jsless PoToken-free fallback; TVHTML5 as a
-                // PoToken-free fallback for age-gated / made-for-kids videos.
-                return List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
-            case ANON:
-            default:
-                // ANDROID_VR is jsless and PoToken-free — ideal primary for anonymous requests.
-                // WEB provides HLS/progressive formats and full metadata. TVHTML5 is a
-                // PoToken-free fallback for videos unplayable on ANDROID_VR (age-gate, kids).
-                return List.of(Client.ANDROID_VR, Client.WEB, Client.TVHTML5);
+        return applyClientOrder(defaults);
+    }
+
+    /**
+     * Applies {@link #clientOrder} to {@code order}: saved clients first, then leftovers.
+     *
+     * <p>Returns {@code order} unchanged when the saved list is empty.
+     */
+    @Nonnull
+    private static List<Client> applyClientOrder(@Nonnull final List<Client> order) {
+        final List<Client> saved;
+        synchronized (CLIENT_ORDER_LOCK) {
+            saved = clientOrder;
         }
+        if (saved.isEmpty()) {
+            return order;
+        }
+        final Set<Client> remaining = new LinkedHashSet<>(order);
+        final List<Client> reordered = new ArrayList<>(order.size());
+        for (final Client client : saved) {
+            if (remaining.remove(client)) {
+                reordered.add(client);
+            }
+        }
+        reordered.addAll(remaining);
+        return reordered;
+    }
+
+    /** Moves {@code client} to index 0; other clients keep relative order. */
+    private static void promoteClient(@Nonnull final Client client) {
+        synchronized (CLIENT_ORDER_LOCK) {
+            final List<Client> next = new ArrayList<>();
+            next.add(client);
+            for (final Client existing : clientOrder) {
+                if (existing != client) {
+                    next.add(existing);
+                }
+            }
+            clientOrder = List.copyOf(next);
+        }
+    }
+
+    /**
+     * Moves {@code client} to the end of the trial order after a playback 403.
+     *
+     * <p>Seeds WEB / TVHTML5 ahead of a lone failing client so the next extract
+     * does not retry the same ANDROID_VR-only saved order.
+     */
+    private static void demoteClient(@Nonnull final Client client) {
+        synchronized (CLIENT_ORDER_LOCK) {
+            final List<Client> next = new ArrayList<>();
+            for (final Client existing : clientOrder) {
+                if (existing != client) {
+                    next.add(existing);
+                }
+            }
+            if (!next.contains(Client.VISIONOS) && client != Client.VISIONOS) {
+                next.add(0, Client.VISIONOS);
+            }
+            if (!next.contains(Client.WEB) && client != Client.WEB) {
+                next.add(0, Client.WEB);
+            }
+            if (!next.contains(Client.TVHTML5) && client != Client.TVHTML5) {
+                next.add(Client.TVHTML5);
+            }
+            next.add(client);
+            clientOrder = List.copyOf(next);
+        }
+    }
+
+    /** Parses a client enum name; unknown names return {@code null}. */
+    @Nullable
+    private static Client parseClientName(@Nullable final String name) {
+        if (name == null) {
+            return null;
+        }
+        final String trimmed = name.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        for (final Client client : Client.values()) {
+            if (client.name().equalsIgnoreCase(trimmed)) {
+                return client;
+            }
+        }
+        return null;
     }
 
     @Nonnull
@@ -1142,23 +1160,13 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         if (hls) {
             if (isLiveScene()) {
                 return fetchIosClient
-                        ? List.of(Client.IOS, Client.WEB, Client.ANDROID)
-                        : List.of(Client.WEB, Client.ANDROID);
+                        ? List.of(Client.IOS, Client.ANDROID, Client.WEB)
+                        : List.of(Client.ANDROID, Client.WEB);
             }
-            switch (authScene()) {
-                case PREMIUM:
-                case LOGGED_IN:
-                    return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR,
-                                    Client.TVHTML5)
-                            : List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
-                case ANON:
-                default:
-                    return fetchIosClient
-                            ? List.of(Client.WEB, Client.IOS, Client.ANDROID_VR,
-                                    Client.TVHTML5)
-                            : List.of(Client.WEB, Client.ANDROID_VR, Client.TVHTML5);
-            }
+            // iOS HLS is the SABR escape hatch; do not rank ANDROID_VR HLS first.
+            return fetchIosClient
+                    ? List.of(Client.IOS, Client.WEB, Client.TVHTML5)
+                    : List.of(Client.WEB, Client.TVHTML5);
         }
         return buildClients();
     }
@@ -1172,27 +1180,6 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         return streamType == StreamType.LIVE_STREAM
                 || streamType == StreamType.AUDIO_LIVE_STREAM
                 || streamType == StreamType.POST_LIVE_STREAM;
-    }
-
-    @Nonnull
-    private AuthScene authScene() {
-        if (isPremiumContext()) {
-            return AuthScene.PREMIUM;
-        }
-        if (isLoggedInContext()) {
-            return AuthScene.LOGGED_IN;
-        }
-        return AuthScene.ANON;
-    }
-
-    private boolean isLoggedInContext() {
-        final ClientProfileProvider provider = clientProfileProvider;
-        return provider != null && provider.isLoggedIn();
-    }
-
-    private boolean isPremiumContext() {
-        final ClientProfileProvider provider = clientProfileProvider;
-        return provider != null && provider.isPremium();
     }
 
     private static void checkPlayabilityStatus(@Nonnull final JsonObject playabilityStatus)
@@ -1400,6 +1387,58 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         state.fetched = true;
     }
 
+    /** iOS player response plus the poToken (and cpn) that produced it. */
+    private static final class IosPlayerResponseResult {
+        @Nonnull
+        private final JsonObject playerResponse;
+        @Nullable
+        private final PoTokenResult poToken;
+        @Nonnull
+        private final String contentPlaybackNonce;
+
+        private IosPlayerResponseResult(@Nonnull final JsonObject playerResponse,
+                                        @Nullable final PoTokenResult poToken,
+                                        @Nonnull final String contentPlaybackNonce) {
+            this.playerResponse = playerResponse;
+            this.poToken = poToken;
+            this.contentPlaybackNonce = contentPlaybackNonce;
+        }
+    }
+
+    /**
+     * Fetches the iOS player response, falling back to a pot-less request when
+     * the poToken-ful one fails.
+     *
+     * <p>YouTube is rolling out a poToken requirement on IOS progressive URLs:
+     * without one they play from the start but 403 on seeks. A token the server
+     * rejects must not lose the iOS client entirely — pot-less URLs still play
+     * sequentially and HLS manifests are pot-exempt, which is the pre-token
+     * behavior.</p>
+     */
+    @Nonnull
+    private IosPlayerResponseResult fetchIosPlayerResponse(
+            @Nonnull final Localization localization,
+            @Nonnull final ContentCountry contentCountry,
+            @Nonnull final String videoId,
+            @Nullable final PoTokenResult iosPoTokenResult)
+            throws IOException, ExtractionException {
+        if (iosPoTokenResult != null) {
+            final String cpn = generateContentPlaybackNonce();
+            try {
+                final JsonObject response = YoutubeStreamHelper.getIosPlayerResponse(
+                        contentCountry, localization, videoId, cpn, iosPoTokenResult);
+                checkPlayabilityStatus(response.getObject(PLAYABILITY_STATUS));
+                return new IosPlayerResponseResult(response, iosPoTokenResult, cpn);
+            } catch (final IOException | ExtractionException e) {
+                // Fall through to a pot-less request.
+            }
+        }
+        final String cpn = generateContentPlaybackNonce();
+        final JsonObject response = YoutubeStreamHelper.getIosPlayerResponse(
+                contentCountry, localization, videoId, cpn, null);
+        return new IosPlayerResponseResult(response, null, cpn);
+    }
+
     private void fetchIosClient(@Nonnull final Client client,
                                 @Nonnull final Localization localization,
                                 @Nonnull final ContentCountry contentCountry,
@@ -1408,10 +1447,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                                 final boolean required)
             throws IOException, ExtractionException {
         final ClientState state = clientState(client);
-        state.contentPlaybackNonce = generateContentPlaybackNonce();
-
-        final JsonObject iosPlayerResponse = YoutubeStreamHelper.getIosPlayerResponse(
-                contentCountry, localization, videoId, state.contentPlaybackNonce, iosPoTokenResult);
+        final IosPlayerResponseResult result = fetchIosPlayerResponse(
+                localization, contentCountry, videoId, iosPoTokenResult);
+        final JsonObject iosPlayerResponse = result.playerResponse;
+        state.contentPlaybackNonce = result.contentPlaybackNonce;
 
         if (required) {
             playerResponse = iosPlayerResponse;
@@ -1435,8 +1474,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                     .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
         }
 
-        if (iosPoTokenResult != null) {
-            state.streamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
+        if (result.poToken != null) {
+            state.streamingUrlsPoToken = result.poToken.streamingDataPoToken;
         }
         state.fetched = true;
     }
@@ -1447,9 +1486,9 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                                    @Nonnull final String videoId,
                                    @Nullable final PoTokenResult iosPoTokenResult)
             throws IOException, ExtractionException {
-        final String cpn = generateContentPlaybackNonce();
-        final JsonObject iosPlayerResponse = YoutubeStreamHelper.getIosPlayerResponse(
-                contentCountry, localization, videoId, cpn, iosPoTokenResult);
+        final IosPlayerResponseResult result = fetchIosPlayerResponse(
+                localization, contentCountry, videoId, iosPoTokenResult);
+        final JsonObject iosPlayerResponse = result.playerResponse;
 
         if (isPlayerResponseNotValid(iosPlayerResponse, videoId)) {
             throw new ExtractionException("IOS player response is not valid");
@@ -1461,10 +1500,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         }
 
         final ClientState state = clientState(client);
-        state.contentPlaybackNonce = cpn;
+        state.contentPlaybackNonce = result.contentPlaybackNonce;
         state.streamingData = streamingData;
-        if (iosPoTokenResult != null) {
-            state.streamingUrlsPoToken = iosPoTokenResult.streamingDataPoToken;
+        if (result.poToken != null) {
+            state.streamingUrlsPoToken = result.poToken.streamingDataPoToken;
         }
         if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
             playerCaptionsTracklistRenderer = iosPlayerResponse.getObject(CAPTIONS)
@@ -1521,39 +1560,55 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         state.fetched = true;
     }
 
-    private void fetchWebClientMetadataAndSetThumbnails(
-            @Nonnull final Localization localization,
-            @Nonnull final ContentCountry contentCountry,
-            @Nonnull final String videoId) {
-        try {
-            final JsonObject webPlayerResponse = YoutubeStreamHelper.getWebMetadataPlayerResponse(
-                    localization, contentCountry, videoId);
+    private void fetchVisionOsClient(@Nonnull final Client client,
+                                     @Nonnull final Localization localization,
+                                     @Nonnull final ContentCountry contentCountry,
+                                     @Nonnull final String videoId)
+            throws IOException, ExtractionException {
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = generateContentPlaybackNonce();
 
-            // Important note: we don't checkPlayabilityStatus() here, because we use this request
-            // exclusively for metadata, not for extracting streams. It turns out that when
-            // YouTube returns a playability status error, the metadata may still be there.
+        playerResponse = YoutubeStreamHelper.getVisionOsPlayerResponse(
+                contentCountry, localization, videoId, state.contentPlaybackNonce);
 
-            if (!isPlayerResponseNotValid(webPlayerResponse, videoId)) {
-                // WEB returns the microformat block and better thumbnails.
-                playerMicroFormatRenderer = webPlayerResponse.getObject("microformat")
-                        .getObject("playerMicroformatRenderer");
-                final JsonObject thumbnailWebJsonObj = webPlayerResponse.getObject(VIDEO_DETAILS)
-                        .getObject(THUMBNAIL);
-                if (thumbnailWebJsonObj.containsKey(THUMBNAILS)) {
-                    thumbnailsArray = thumbnailWebJsonObj.getArray(THUMBNAILS);
-                } else {
-                    thumbnailsArray = playerResponse.getObject(VIDEO_DETAILS)
-                            .getObject(THUMBNAIL)
-                            .getArray(THUMBNAILS);
-                }
-            }
-        } catch (final Exception e) {
-            playerMicroFormatRenderer = new JsonObject();
-            thumbnailsArray = playerResponse.getObject(VIDEO_DETAILS)
-                    .getObject(THUMBNAIL)
-                    .getArray(THUMBNAILS);
+        checkPlayabilityStatus(playerResponse.getObject(PLAYABILITY_STATUS));
+        if (isPlayerResponseNotValid(playerResponse, videoId)) {
+            throw new ExtractionException("VISIONOS player response is not valid");
         }
+
+        state.streamingData = playerResponse.getObject(STREAMING_DATA);
+
+        if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
+            playerCaptionsTracklistRenderer = playerResponse.getObject(CAPTIONS)
+                    .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
+        }
+        state.fetched = true;
     }
+
+    private void prefetchVisionOsClient(@Nonnull final Client client,
+                                        @Nonnull final Localization localization,
+                                        @Nonnull final ContentCountry contentCountry,
+                                        @Nonnull final String videoId)
+            throws IOException, ExtractionException {
+        final String cpn = generateContentPlaybackNonce();
+        final JsonObject visionOsPlayerResponse = YoutubeStreamHelper.getVisionOsPlayerResponse(
+                contentCountry, localization, videoId, cpn);
+
+        checkPlayabilityStatus(visionOsPlayerResponse.getObject(PLAYABILITY_STATUS));
+        if (isPlayerResponseNotValid(visionOsPlayerResponse, videoId)) {
+            throw new ExtractionException("VISIONOS player response is not valid");
+        }
+
+        final ClientState state = clientState(client);
+        state.contentPlaybackNonce = cpn;
+        state.streamingData = visionOsPlayerResponse.getObject(STREAMING_DATA);
+        if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
+            playerCaptionsTracklistRenderer = visionOsPlayerResponse.getObject(CAPTIONS)
+                    .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
+        }
+        state.fetched = true;
+    }
+
     private void setMetadataFromPlayerResponse(
             @Nonnull final JsonObject sourcePlayerResponse) {
         try {
@@ -1594,18 +1649,33 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                                 : poTokenProvider.getWebClientPoToken(reqVideoId);
                         webPoTokenKnown = true;
                     }
-                    fetchWebClient(client, reqLocalization, reqContentCountry, reqVideoId, reqWebPoToken,
+                    fetchWebClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                            reqWebPoToken,
                             YoutubeJavaScriptPlayerManager.getSignatureTimestamp(reqVideoId));
                     break;
                 case IOS:
-                    fetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken,
-                            required);
+                    if (!iosPoTokenKnown) {
+                        reqIosPoToken = poTokenProvider == null
+                                ? null
+                                : poTokenProvider.getIosClientPoToken(reqVideoId);
+                        iosPoTokenKnown = true;
+                    }
+                    fetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                            reqIosPoToken, required);
                     break;
                 case TVHTML5:
                     fetchTvHtml5Client(client, reqLocalization, reqContentCountry, reqVideoId);
                     break;
+                case VISIONOS:
+                    fetchVisionOsClient(client, reqLocalization, reqContentCountry, reqVideoId);
+                    break;
                 default:
                     throw new ExtractionException("Unsupported client");
+            }
+            // ANDROID_VR URLs 403 mid-stream without a poToken. Do not persist
+            // it as the preferred client or the next extract retries VR first.
+            if (required && client != Client.ANDROID_VR) {
+                promoteClient(client);
             }
         } finally {
             if (!required) {
@@ -1636,10 +1706,20 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                         YoutubeJavaScriptPlayerManager.getSignatureTimestamp(reqVideoId));
                 break;
             case IOS:
-                prefetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId, reqIosPoToken);
+                if (!iosPoTokenKnown) {
+                    reqIosPoToken = poTokenProvider == null
+                            ? null
+                            : poTokenProvider.getIosClientPoToken(reqVideoId);
+                    iosPoTokenKnown = true;
+                }
+                prefetchIosClient(client, reqLocalization, reqContentCountry, reqVideoId,
+                        reqIosPoToken);
                 break;
             case TVHTML5:
                 prefetchTvHtml5Client(client, reqLocalization, reqContentCountry, reqVideoId);
+                break;
+            case VISIONOS:
+                prefetchVisionOsClient(client, reqLocalization, reqContentCountry, reqVideoId);
                 break;
             default:
                 throw new ExtractionException("Unsupported client");
@@ -1659,8 +1739,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 } catch (final IOException | ExtractionException e) {
                     resetClient(client);
                 } finally {
-                    // Detach the thread reference once the prefetch is done so later
-                    // ensureClient* callers know there is nothing left to join.
+                    // Clear when done so resolveClient* does not join a finished thread.
                     clientState(client).prefetchThread = null;
                 }
             }, "yt-client-" + client.name().toLowerCase(Locale.ROOT));
@@ -1671,23 +1750,11 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         return threads;
     }
 
-    private void joinPrefetch(@Nonnull final List<Thread> threads) throws IOException {
-        for (final Thread thread : threads) {
-            try {
-                thread.join();
-            } catch (final InterruptedException e) {
-                thread.interrupt();
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while prefetching YouTube clients", e);
-            }
-        }
-    }
-
     /**
-     * If a background prefetch for {@code client} is still in flight, wait for it to finish.
-     * This lets lazy {@code ensureClient*} callers reuse the in-flight request instead of
-     * issuing a duplicate fetch. After this returns, {@link #isClientFetched} reflects the
-     * prefetch outcome.
+     * Waits for an in-flight prefetch of {@code client}, if any.
+     *
+     * <p>Lets {@code resolveClient*} reuse the in-flight request. After return,
+     * {@link #isClientFetched} reflects the prefetch outcome.
      */
     private void awaitPrefetch(@Nonnull final Client client) {
         final Thread thread = clientState(client).prefetchThread;
@@ -1701,7 +1768,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             Thread.currentThread().interrupt();
         }
     }
-    private void ensureClientForManifest(@Nonnull final Client client,
+    private void resolveClientForManifest(@Nonnull final Client client,
                                          @Nonnull final String manifestKey) {
         if (!isNullOrEmpty(getManifestFromClient(client, manifestKey))) {
             return;
@@ -1719,7 +1786,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             resetClient(client);
         }
     }
-    private void ensureClientForStreams(@Nonnull final Client client,
+    private void resolveClientForStreams(@Nonnull final Client client,
                                         @Nonnull final String streamingDataKey,
                                         @Nonnull final ItagItem.ItagType itagTypeWanted) {
         if (hasUsableStreams(getStreamingData(client), streamingDataKey, itagTypeWanted)) {
@@ -1872,6 +1939,11 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
     @Nonnull
     private JsonObject getVideoInfoRenderer(@Nonnull final String videoRendererName) {
+        // The player path skips /next; renderers stay empty until it is fetched
+        // and every caller falls back to the player response or microformat.
+        if (nextResponse == null) {
+            return new JsonObject();
+        }
         return nextResponse.getObject("contents")
                 .getObject("twoColumnWatchNextResults")
                 .getObject("results")
@@ -1895,7 +1967,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             final String videoId = getId();
             final List<ItagChoice<T>> candidates = new ArrayList<>();
             for (final Client client : clients) {
-                ensureClientForStreams(client, streamingDataKey, itagTypeWanted);
+                resolveClientForStreams(client, streamingDataKey, itagTypeWanted);
                 final String poToken = getStreamingUrlsPoToken(client);
                 final boolean hasPlayerPoToken = hasPlayerPoToken(client);
                 final List<T> streamList = getStreamsFromStreamingDataKey(
@@ -1919,7 +1991,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             if (candidates.isEmpty()) {
                 return new ArrayList<>();
             }
-            return candidates.get(0).getStreams();
+            return selectItagStreams(candidates);
         } catch (final Exception e) {
             throw new ParsingException(
                     "Could not get " + kind.name().toLowerCase(Locale.ROOT).replace('_', '-')
@@ -1933,35 +2005,69 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         candidates.sort(itagComparator());
         switch (kind) {
             case AUDIO:
-                audioChoices = (List<ItagChoice<AudioStream>>) (List<?>) new ArrayList<>(candidates);
+                audioChoices = (List<ItagChoice<AudioStream>>) (List<?>)
+                        new ArrayList<>(candidates);
                 break;
             case VIDEO_ONLY:
-                videoOnlyChoices = (List<ItagChoice<VideoStream>>) (List<?>) new ArrayList<>(candidates);
+                videoOnlyChoices = (List<ItagChoice<VideoStream>>) (List<?>)
+                        new ArrayList<>(candidates);
                 break;
             case MUXED:
-                muxedChoices = (List<ItagChoice<VideoStream>>) (List<?>) new ArrayList<>(candidates);
+                muxedChoices = (List<ItagChoice<VideoStream>>) (List<?>)
+                        new ArrayList<>(candidates);
                 break;
             default:
                 break;
         }
     }
 
+    /**
+     * Returns the streams of the best-ranked candidate instead of merging every
+     * client's streams.
+     *
+     * <p>{@link #setItagChoices} sorts candidates with {@link #itagComparator()}:
+     * streaming-poToken clients first, then non-{@code ANDROID_VR} clients by
+     * trial order ({@code WEB} → {@code TVHTML5} → {@code IOS}), then
+     * {@code ANDROID_VR}. The previous merge let a pot-less {@code IOS} avc
+     * stream outrank {@code WEB} vp9 in downstream per-itag dedup, so playback
+     * kept selecting googlevideo URLs that 403 (IOS progressive URLs need a
+     * poToken; HLS is exempt). The merge also made {@link #demoteClient(String)}
+     * ineffective: demotion only reorders the trial list, so a playback-403
+     * re-extract returned the same pool and looped on the same URLs. Taking only
+     * the head candidate makes each playback 403 move stream selection to the
+     * next client on re-extract.</p>
+     */
     @Nonnull
-    private Comparator<ManifestChoice> manifestComparator(@Nonnull final ManifestKind manifestKind) {
+    private <T extends Stream> List<T> selectItagStreams(
+            @Nonnull final List<ItagChoice<T>> candidates) {
+        return new ArrayList<>(candidates.get(0).getStreams());
+    }
+
+    @Nonnull
+    private Comparator<ManifestChoice> manifestComparator(
+            @Nonnull final ManifestKind manifestKind) {
         final List<Client> order = manifestClientOrder(manifestKind == ManifestKind.HLS);
+        if (manifestKind == ManifestKind.HLS) {
+            // HLS does not need a streaming poToken. WEB's player pot would
+            // otherwise beat iOS HLS, which is the format that actually plays.
+            return Comparator.comparingInt(
+                    (ManifestChoice choice) -> clientRank(choice.client, order));
+        }
         return Comparator
-                .comparingInt((ManifestChoice choice) -> clientRank(choice.client, order))
-                .thenComparing(ManifestChoice::hasStreamPoToken, Comparator.reverseOrder())
-                .thenComparing(ManifestChoice::hasPlayerPoToken, Comparator.reverseOrder());
+                .comparing(ManifestChoice::hasStreamPoToken, Comparator.reverseOrder())
+                .thenComparing(ManifestChoice::hasPlayerPoToken, Comparator.reverseOrder())
+                .thenComparingInt((ManifestChoice choice) -> clientRank(choice.client, order));
     }
 
     @Nonnull
     private <T extends Stream> Comparator<ItagChoice<T>> itagComparator() {
         final List<Client> order = buildClients();
         return Comparator
-                .comparingInt((ItagChoice<T> choice) -> clientRank(choice.client, order))
-                .thenComparing(ItagChoice::hasStreamPoToken, Comparator.reverseOrder())
-                .thenComparing(ItagChoice::hasPlayerPoToken, Comparator.reverseOrder());
+                .comparing((ItagChoice<T> choice) -> choice.hasStreamPoToken(),
+                        Comparator.reverseOrder())
+                .thenComparing(ItagChoice::hasPlayerPoToken, Comparator.reverseOrder())
+                .thenComparingInt(choice -> choice.client == Client.ANDROID_VR ? 1 : 0)
+                .thenComparingInt(choice -> clientRank(choice.client, order));
     }
 
     private int clientRank(@Nonnull final Client client, @Nonnull final List<Client> order) {
@@ -2235,6 +2341,14 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         final String codec = mimeType.contains("codecs")
                 ? mimeType.split("\"")[1] : "";
 
+        // AV1 software-decodes poorly on mid-range devices and, on pot-less
+        // adaptive URLs (the 64 s read window), cannot even be streamed past
+        // the first minute. Keep it only when a poToken makes the URL fully
+        // readable; otherwise prefer the vp9/avc1 variant of the same height.
+        if (poToken == null && codec.startsWith("av01")) {
+            return null;
+        }
+
         itagItem.setBitrate(formatData.getInt("bitrate"));
         itagItem.setWidth(formatData.getInt("width"));
         itagItem.setHeight(formatData.getInt("height"));
@@ -2462,7 +2576,13 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             return Collections.emptyList();
         }
 
-        final long duration = getLength();
+        // Segment-only path may lack player metadata.
+        final long duration;
+        if (isPageFetched()) {
+            duration = getLength();
+        } else {
+            duration = Long.MAX_VALUE;
+        }
         final List<StreamSegment> segments = new ArrayList<>();
         for (final JsonObject segmentJson : segmentsArray.stream()
                 .filter(JsonObject.class::isInstance)
@@ -2543,10 +2663,84 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         YoutubeStreamExtractor.poTokenProvider = poTokenProvider;
     }
 
+    /**
+     * Sets the client trial order from enum names.
+     *
+     * <p>Call at startup with a saved {@link #getClientOrder()} value. Unknown names are
+     * dropped. {@code null} or empty clears the order.
+     */
     @SuppressWarnings("unused")
-    public static void setClientProfileProvider(
-            @Nullable final ClientProfileProvider clientProfileProvider) {
-        YoutubeStreamExtractor.clientProfileProvider = clientProfileProvider;
+    public static void setClientOrder(@Nullable final List<String> order) {
+        if (order == null || order.isEmpty()) {
+            clearClientOrder();
+            return;
+        }
+        final List<Client> cleaned = new ArrayList<>(order.size());
+        for (final String name : order) {
+            final Client client = parseClientName(name);
+            if (client != null && !cleaned.contains(client)) {
+                cleaned.add(client);
+            }
+        }
+        synchronized (CLIENT_ORDER_LOCK) {
+            clientOrder = List.copyOf(cleaned);
+        }
+    }
+
+    /** Clears the client trial order. */
+    @SuppressWarnings("unused")
+    public static void clearClientOrder() {
+        synchronized (CLIENT_ORDER_LOCK) {
+            clientOrder = List.of();
+        }
+    }
+
+    /** Returns the client trial order as enum names, or empty if unset. */
+    @Nonnull
+    @SuppressWarnings("unused")
+    public static List<String> getClientOrder() {
+        synchronized (CLIENT_ORDER_LOCK) {
+            final List<String> names = new ArrayList<>(clientOrder.size());
+            for (final Client client : clientOrder) {
+                names.add(client.name());
+            }
+            return List.copyOf(names);
+        }
+    }
+
+    /**
+     * Moves one client to the front of the trial order (same as a successful required fetch).
+     *
+     * <p>Unknown names are ignored.
+     */
+    @SuppressWarnings("unused")
+    public static void promoteClient(@Nullable final String clientName) {
+        final Client client = parseClientName(clientName);
+        if (client != null) {
+            promoteClient(client);
+        }
+    }
+
+    /**
+     * Moves a client to the end of the trial order after googlevideo 403s.
+     *
+     * <p>Unknown names are ignored.
+     */
+    @SuppressWarnings("unused")
+    public static void demoteClient(@Nullable final String clientName) {
+        final Client client = parseClientName(clientName);
+        if (client != null) {
+            demoteClient(client);
+        }
+    }
+
+    /** Returns the first client name in the trial order, or {@code null} if empty. */
+    @Nullable
+    @SuppressWarnings("unused")
+    public static String getClientHead() {
+        synchronized (CLIENT_ORDER_LOCK) {
+            return clientOrder.isEmpty() ? null : clientOrder.get(0).name();
+        }
     }
 
     /**

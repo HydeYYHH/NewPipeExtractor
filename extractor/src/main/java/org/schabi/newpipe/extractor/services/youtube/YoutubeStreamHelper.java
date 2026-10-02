@@ -33,6 +33,7 @@ import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getClientHeaders;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getClientVersion;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getIosUserAgent;
+import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getVisionOsUserAgent;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getOriginReferrerHeaders;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getValidJsonResponseBody;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.getYouTubeHeaders;
@@ -326,6 +327,54 @@ public final class YoutubeStreamHelper {
                 InnertubeClientRequestInfo.ofTvHtml5Client();
 
         final Map<String, List<String>> headers = getMobileClientHeaders(TVHTML5_USER_AGENT);
+
+        innertubeClientRequestInfo.clientInfo.visitorData =
+                YoutubeParsingHelper.getVisitorDataFromInnertube(innertubeClientRequestInfo,
+                        localization, contentCountry, headers, YOUTUBEI_V1_GAPIS_URL, null, false);
+
+        final JsonBuilder<JsonObject> builder = prepareJsonBuilder(localization, contentCountry,
+                innertubeClientRequestInfo, null);
+
+        addVideoIdCpnAndOkChecks(builder, videoId, cpn);
+
+        final byte[] body = JsonWriter.string(builder.done())
+                .getBytes(StandardCharsets.UTF_8);
+
+        final String url = YOUTUBEI_V1_GAPIS_URL + PLAYER + "?" + DISABLE_PRETTY_PRINT_PARAMETER
+                + "&t=" + generateTParameter() + "&id=" + videoId;
+
+        return JsonUtils.toJsonObject(getValidJsonResponseBody(
+                getDownloader().postWithContentTypeJson(url, headers, body, localization)));
+    }
+
+    /**
+     * Gets the player response of a video using the {@code VISIONOS} client.
+     *
+     * <p>
+     * As of 2026-08 this is the only client that returns direct googlevideo URLs
+     * on adaptive formats without a poToken and without the ~64 s read window
+     * that pot-less IOS/ANDROID URLs are subject to. A visitorData is required
+     * (as with IOS), otherwise the response is LOGIN_REQUIRED with a bot-check
+     * reason.
+     * </p>
+     *
+     * @param contentCountry the content country
+     * @param localization   the localization
+     * @param videoId        the video id
+     * @param cpn            the content playback nonce
+     * @return the player response as a {@link JsonObject}
+     */
+    @Nonnull
+    public static JsonObject getVisionOsPlayerResponse(
+            @Nonnull final ContentCountry contentCountry,
+            @Nonnull final Localization localization,
+            @Nonnull final String videoId,
+            @Nonnull final String cpn) throws IOException, ExtractionException {
+        final InnertubeClientRequestInfo innertubeClientRequestInfo =
+                InnertubeClientRequestInfo.ofVisionOsClient();
+
+        final Map<String, List<String>> headers = getMobileClientHeaders(
+                getVisionOsUserAgent(localization));
 
         innertubeClientRequestInfo.clientInfo.visitorData =
                 YoutubeParsingHelper.getVisitorDataFromInnertube(innertubeClientRequestInfo,

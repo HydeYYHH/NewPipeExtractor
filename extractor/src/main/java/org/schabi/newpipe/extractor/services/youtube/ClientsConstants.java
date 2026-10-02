@@ -126,4 +126,19 @@ final class ClientsConstants {
     static final String TVHTML5_CLIENT_VERSION = "7.20260120.13.00";
     static final String TVHTML5_USER_AGENT =
             "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
+
+    // VISIONOS (Apple Vision Pro YouTube app): PoToken-free direct-stream client.
+    // As of 2026-08 it is the only client whose adaptive formats still carry direct
+    // googlevideo URLs without a poToken and without the ~64 s read window.
+    // Requires a visitorData (like IOS), else LOGIN_REQUIRED "not a bot".
+
+    static final String VISIONOS_CLIENT_ID = "101";
+    static final String VISIONOS_CLIENT_NAME = "VISIONOS";
+    // See https://apps.apple.com/us/app/youtube-for-visionos/id6745572359
+    static final String VISIONOS_CLIENT_VERSION = "1.04";
+    // See https://theapplewiki.com/wiki/Apple_Vision_Pro_(M5)
+    static final String VISIONOS_DEVICE_MODEL = "RealityDevice17,1";
+    // See https://theapplewiki.com/wiki/Firmware/Apple_Vision/26.x
+    static final String VISIONOS_OS_VERSION = "26.6.0.23O770";
+    static final String VISIONOS_USER_AGENT_VERSION = "26_6_0";
 }
