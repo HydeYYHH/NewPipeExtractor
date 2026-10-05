@@ -20,6 +20,12 @@
 
 package org.schabi.newpipe.extractor.services.youtube.extractors;
 
+import org.schabi.newpipe.extractor.services.youtube.streams.ExtractionContext;
+import org.schabi.newpipe.extractor.services.youtube.streams.YoutubeStreamEngine;
+import org.schabi.newpipe.extractor.services.youtube.streams.StreamCandidate;
+import org.schabi.newpipe.extractor.services.youtube.streams.FormatKey;
+import org.schabi.newpipe.extractor.services.youtube.streams.RequestPlan;
+
 import static org.schabi.newpipe.extractor.services.youtube.ItagItem.APPROX_DURATION_MS_UNKNOWN;
 import static org.schabi.newpipe.extractor.services.youtube.ItagItem.CONTENT_LENGTH_UNKNOWN;
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeDescriptionHelper.attributedDescriptionToHtml;
@@ -107,6 +113,22 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class YoutubeStreamExtractor extends StreamExtractor {
+    private ExtractionContext extractionContext;
+    private YoutubeStreamEngine.Result engineResult;
+
+    /** Explicit host context. Set before fetchPage; the old Java API remains available. */
+    public void setExtractionContext(
+            final ExtractionContext context) {
+        if (isPageFetched()) {
+            throw new IllegalStateException("Page already fetched");
+        }
+        extractionContext = java.util.Objects.requireNonNull(context);
+    }
+
+    public YoutubeStreamEngine.Result
+            getEngineResult() {
+        return engineResult;
+    }
     private enum Client { ANDROID_VR, ANDROID, WEB, IOS, TVHTML5, VISIONOS }
 
     private enum ManifestKind { DASH, HLS }
@@ -723,13 +745,26 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     @Override
     public String getDashMpdUrl() throws ParsingException {
         assertPageFetched();
+        if (engineResult != null) {
+            return engineManifest(false);
+        }
         return getManifestUrl(ManifestKind.DASH, "mpd_version=7");
     }
     @Nonnull
     @Override
     public String getHlsUrl() throws ParsingException {
         assertPageFetched();
+        if (engineResult != null) {
+            return engineManifest(true);
+        }
         return getManifestUrl(ManifestKind.HLS, "");
+    }
+    private String engineManifest(final boolean hls) {
+        return engineResult.manifests.stream()
+                .filter(candidate -> candidate.key.protocol == (hls
+                        ? RequestPlan.Protocol.HLS
+                        : RequestPlan.Protocol.DASH))
+                .map(candidate -> candidate.url).findFirst().orElse("");
     }
     @Nonnull
     private String getManifestUrl(@Nonnull final ManifestKind manifestKind,
@@ -960,6 +995,15 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         reqLocalization = getExtractorLocalization();
         reqContentCountry = getExtractorContentCountry();
 
+        if (extractionContext != null) {
+            engineResult = new YoutubeStreamEngine().extract(reqVideoId, extractionContext);
+            playerResponse = engineResult.player;
+            clients = Collections.emptyList();
+            setStreamType();
+            setMetadataFromPlayerResponse(playerResponse);
+            return;
+        }
+
         final PoTokenProvider provider = poTokenProvider;
         final boolean noPo = provider == null;
         reqAndroidPoToken = noPo ? null : provider.getAndroidClientPoToken(reqVideoId);
@@ -1021,6 +1065,10 @@ public class YoutubeStreamExtractor extends StreamExtractor {
      */
     public void fetchNextResponse() throws IOException, ExtractionException {
         if (nextResponse != null) {
+            return;
+        }
+        if (extractionContext != null) {
+            nextResponse = new YoutubeStreamEngine().next(getId(), extractionContext);
             return;
         }
         if (reqVideoId == null) {
@@ -1964,6 +2012,32 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             final java.util.function.Function<ItagInfo, T> builder,
             final StreamChoiceKind kind) throws ParsingException {
         try {
+            if (engineResult != null) {
+                final List<T> result = new ArrayList<>();
+                final java.util.Set<FormatKey>
+                        seen = new java.util.HashSet<>();
+                for (final StreamCandidate
+                        candidate : engineResult.candidates) {
+                    final ItagItem.ItagType type = candidate.audioOnly ? ItagItem.ItagType.AUDIO
+                            : candidate.videoOnly ? ItagItem.ItagType.VIDEO_ONLY
+                            : ItagItem.ItagType.VIDEO;
+                    if (type != itagTypeWanted || !seen.add(candidate.key)) {
+                        continue;
+                    }
+                    final String mime = candidate.format.getString("mimeType", "");
+                    final MediaFormat media = mime.startsWith("audio/")
+                            ? mime.contains("webm") ? MediaFormat.WEBMA : MediaFormat.M4A
+                            : mime.contains("webm") ? MediaFormat.WEBM : MediaFormat.MPEG_4;
+                    final ItagItem item = type == ItagItem.ItagType.AUDIO
+                            ? new ItagItem(candidate.key.itag, type, media,
+                                    candidate.format.getInt("bitrate") / 1000)
+                            : new ItagItem(candidate.key.itag, type, media,
+                                    candidate.format.getString("qualityLabel", ""));
+                    result.add(builder.apply(populateItagInfo(candidate.url,
+                            candidate.format, item, type)));
+                }
+                return result;
+            }
             final String videoId = getId();
             final List<ItagChoice<T>> candidates = new ArrayList<>();
             for (final Client client : clients) {
@@ -2335,19 +2409,14 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             streamUrl += "&pot=" + poToken;
         }
 
+        return populateItagInfo(streamUrl, formatData, itagItem, itagType);
+    }
+
+    private ItagInfo populateItagInfo(final String streamUrl, final JsonObject formatData,
+                                     final ItagItem itagItem, final ItagItem.ItagType itagType) {
         final JsonObject initRange = formatData.getObject("initRange");
         final JsonObject indexRange = formatData.getObject("indexRange");
-        final String mimeType = formatData.getString("mimeType", "");
-        final String codec = mimeType.contains("codecs")
-                ? mimeType.split("\"")[1] : "";
-
-        // AV1 software-decodes poorly on mid-range devices and, on pot-less
-        // adaptive URLs (the 64 s read window), cannot even be streamed past
-        // the first minute. Keep it only when a poToken makes the URL fully
-        // readable; otherwise prefer the vp9/avc1 variant of the same height.
-        if (poToken == null && codec.startsWith("av01")) {
-            return null;
-        }
+        final String codec = YoutubeStreamEngine.codec(formatData.getString("mimeType", ""));
 
         itagItem.setBitrate(formatData.getInt("bitrate"));
         itagItem.setWidth(formatData.getInt("width"));
@@ -2370,7 +2439,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             itagItem.setFps(formatData.getInt("fps"));
         } else if (itagType == ItagItem.ItagType.AUDIO) {
             // YouTube return the audio sample rate as a string
-            itagItem.setSampleRate(Integer.parseInt(formatData.getString("audioSampleRate")));
+            itagItem.setSampleRate(Integer.parseInt(formatData.getString("audioSampleRate", "-1")));
             itagItem.setAudioChannels(formatData.getInt("audioChannels",
                     // Most audio streams have two audio channels, so use this value if the real
                     // count cannot be extracted

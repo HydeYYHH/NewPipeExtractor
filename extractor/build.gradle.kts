@@ -83,7 +83,7 @@ tasks.checkstyleTest {
 }
 
 dependencies {
-    implementation(libs.newpipe.nanojson)
+    api(libs.newpipe.nanojson)
     implementation(libs.jsoup)
     implementation(libs.google.jsr305)
     implementation(libs.google.protobuf)

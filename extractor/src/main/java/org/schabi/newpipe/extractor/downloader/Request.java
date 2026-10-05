@@ -25,6 +25,7 @@ public class Request {
     private final byte[] dataToSend;
     @Nullable
     private final Localization localization;
+    private final long executionDeadlineNanos;
 
     public Request(final String httpMethod,
                    final String url,
@@ -32,10 +33,19 @@ public class Request {
                    @Nullable final byte[] dataToSend,
                    @Nullable final Localization localization,
                    final boolean automaticLocalizationHeader) {
+        this(httpMethod, url, headers, dataToSend, localization, automaticLocalizationHeader,
+                Long.MAX_VALUE);
+    }
+
+    private Request(final String httpMethod, final String url,
+                    @Nullable final Map<String, List<String>> headers,
+                    @Nullable final byte[] dataToSend, @Nullable final Localization localization,
+                    final boolean automaticLocalizationHeader, final long executionDeadlineNanos) {
         this.httpMethod = Objects.requireNonNull(httpMethod, "Request's httpMethod is null");
         this.url = Objects.requireNonNull(url, "Request's url is null");
         this.dataToSend = dataToSend;
         this.localization = localization;
+        this.executionDeadlineNanos = executionDeadlineNanos;
 
         final Map<String, List<String>> actualHeaders = new LinkedHashMap<>();
         if (headers != null) {
@@ -50,7 +60,13 @@ public class Request {
 
     private Request(final Builder builder) {
         this(builder.httpMethod, builder.url, builder.headers, builder.dataToSend,
-                builder.localization, builder.automaticLocalizationHeader);
+                builder.localization, builder.automaticLocalizationHeader,
+                builder.executionDeadlineNanos);
+    }
+
+    /** Host-only monotonic deadline; never sent as an HTTP header. */
+    public long executionDeadlineNanos() {
+        return executionDeadlineNanos;
     }
 
     /**
@@ -109,8 +125,14 @@ public class Request {
         private byte[] dataToSend;
         private Localization localization;
         private boolean automaticLocalizationHeader = true;
+        private long executionDeadlineNanos = Long.MAX_VALUE;
 
         public Builder() {
+        }
+
+        public Builder executionDeadlineNanos(final long value) {
+            executionDeadlineNanos = value;
+            return this;
         }
 
         /**

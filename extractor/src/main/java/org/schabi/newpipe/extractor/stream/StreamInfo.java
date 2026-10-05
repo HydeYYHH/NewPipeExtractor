@@ -224,9 +224,10 @@ public class StreamInfo extends Info {
             addWrappedErrorUnlessInterrupted(streamInfo, "Couldn't get video only streams", e);
         }
 
-        // Either audio or video has to be available, otherwise we didn't get a stream (since
-        // videoOnly are optional, they don't count).
-        if ((streamInfo.videoStreams.isEmpty()) && (streamInfo.audioStreams.isEmpty())) {
+        // A manifest is playable without a separate file-stream catalogue (e.g. VISIONOS HLS).
+        if (streamInfo.videoStreams.isEmpty() && streamInfo.audioStreams.isEmpty()
+                && streamInfo.videoOnlyStreams.isEmpty() && isNullOrEmpty(streamInfo.dashMpdUrl)
+                && isNullOrEmpty(streamInfo.hlsUrl)) {
             throw new StreamExtractException(
                     "Could not get any stream. See error variable to get further details.");
         }
