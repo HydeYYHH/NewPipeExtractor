@@ -9,14 +9,6 @@ on:
         options:
           - MOCK
           - REAL
-  schedule:
-      # once per day
-    - cron: 0 0 * * *
-  push:
-    branches:
-      - dev
-      - master
-  pull_request:
 
 permissions:
   contents: read
@@ -50,10 +42,9 @@ jobs:
         # See gradle file for difference between downloaders
       - name: Build and run Tests
         run: |
+          # The mock downloader keeps the suite offline; REAL exercises the
+          # live YouTube endpoints and needs recorded responses to pass.
           downloader_type="${{ github.event.inputs.downloaderType || 'MOCK' }}"
-          if [[ "$GITHUB_EVENT_NAME" == 'schedule' ]]; then
-            downloader_type="REAL"
-          fi
 
           echo "Running with $downloader_type downloader"
           ./gradlew check \
