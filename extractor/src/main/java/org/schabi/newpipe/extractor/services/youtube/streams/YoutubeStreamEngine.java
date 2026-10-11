@@ -109,10 +109,14 @@ public final class YoutubeStreamEngine {
         final List<Rejection> rejected = new ArrayList<>();
         final Map<String, Caption> captionTracks = new LinkedHashMap<>();
         int successes = 0;
-        final List<ClientProfile> profiles = profiles(context);
+        boolean live = context.live;
+        final List<ClientProfile> profiles = profiles(context, live);
+        final Set<ClientProfile> attempted = new LinkedHashSet<>();
         IOException lastTransport = null;
         StreamHttpException lastPlayabilityCaptcha = null;
-        for (final ClientProfile profile : profiles) {
+        for (int profileIndex = 0; profileIndex < profiles.size(); profileIndex++) {
+            final ClientProfile profile = profiles.get(profileIndex);
+            attempted.add(profile);
             context.check();
             final long start = System.nanoTime();
             try {
@@ -151,6 +155,15 @@ public final class YoutubeStreamEngine {
                 if (primary == null) {
                     primary = player;
                     primaryProfile = profile;
+                }
+                if (!live && (player.getObject("playabilityStatus").has("liveStreamability")
+                    || player.getObject("videoDetails").getBoolean("isLive", false))
+                    && !player.getObject("videoDetails").getBoolean("isPostLiveDvr", false)) {
+                    live = true;
+                    final List<ClientProfile> remaining = profiles(context, true);
+                    remaining.removeAll(attempted);
+                    profiles.subList(profileIndex + 1, profiles.size()).clear();
+                    profiles.addAll(remaining);
                 }
                 final int candidateBefore = candidates.size();
                 final int manifestBefore = manifests.size();
@@ -191,13 +204,13 @@ public final class YoutubeStreamEngine {
                 final int after = candidates.size() + (context.catalog ? 0 : manifests.size());
                 if (before != after) {
                     successes++;
-                    recordUsefulProfile(context, profile,
+                    recordUsefulProfile(context, profile, live,
                         candidates.subList(candidateBefore, candidates.size()),
                         manifests.subList(manifestBefore, manifests.size()));
                     if (
                         context.catalog
                             ? successes >= 2 && hasFilePair(candidates)
-                            : context.demand.satisfied(candidates, manifests)
+                            : playbackSatisfied(context, live, candidates, manifests)
                     ) {
                         break;
                     }
@@ -219,6 +232,9 @@ public final class YoutubeStreamEngine {
             }
         }
         context.check();
+        if (!context.catalog && live && !playbackSatisfied(context, true, candidates, manifests)) {
+            throw new ExtractionException("LIVE_STREAM_SOURCE_UNAVAILABLE", lastTransport);
+        }
         if (primary == null || (candidates.isEmpty() && manifests.isEmpty())) {
             if (lastPlayabilityCaptcha != null) {
                 throw lastPlayabilityCaptcha;
@@ -251,13 +267,28 @@ public final class YoutubeStreamEngine {
     private static void recordUsefulProfile(
         final ExtractionContext context,
         final ClientProfile profile,
+        final boolean live,
         final List<StreamCandidate> candidates,
         final List<StreamCandidate> manifests
     ) throws IOException {
         if (context.clientOrder != null && (context.catalog ? hasFilePair(candidates)
-                : context.demand.satisfied(candidates, manifests))) {
+                : playbackSatisfied(context, live, candidates, manifests))) {
             context.clientOrder.succeeded(context, profile);
         }
+    }
+
+    private static boolean playbackSatisfied(
+        final ExtractionContext context,
+        final boolean live,
+        final List<StreamCandidate> candidates,
+        final List<StreamCandidate> manifests
+    ) {
+        if (!live) {
+            return context.demand.satisfied(candidates, manifests);
+        }
+        return !manifests.isEmpty()
+            || candidates.stream().anyMatch(candidate ->
+                !candidate.audioOnly && !candidate.videoOnly);
     }
 
     private static boolean hasFilePair(final List<StreamCandidate> candidates) {
@@ -276,22 +307,23 @@ public final class YoutubeStreamEngine {
         );
     }
 
-    private static List<ClientProfile> profiles(final ExtractionContext context) {
+    private static List<ClientProfile> profiles(final ExtractionContext context,
+                                                final boolean live) {
         final List<ClientProfile> profiles = new ArrayList<>(ClientProfile.route(
-            context.session, context.live, !context.catalog && context.playbackPriority
+            context.session, live, !context.catalog && context.playbackPriority
         ));
         // A playable manifest is not a downloadable file. Keep the same final
         // direct-URL fallback that playback uses when web responses are SABR-only.
-        if (context.catalog && !context.live && !profiles.contains(ClientProfile.VISIONOS)) {
+        if (context.catalog && !live && !profiles.contains(ClientProfile.VISIONOS)) {
             profiles.add(ClientProfile.VISIONOS);
         }
         // Ordinary signed-in sessions can also use Creator. Keep it as a final
         // authenticated fallback when web clients expose only SABR and the
         // cookie-free profile is challenged; its GVS token policy still applies.
-        if (context.session.account == YoutubeSession.Account.AUTHENTICATED) {
+        if (!live && context.session.account == YoutubeSession.Account.AUTHENTICATED) {
             profiles.add(ClientProfile.WEB_CREATOR);
         }
-        return context.clientOrder == null ? profiles
+        return context.clientOrder == null || live != context.live ? profiles
             : context.clientOrder.order(context, profiles);
     }
 

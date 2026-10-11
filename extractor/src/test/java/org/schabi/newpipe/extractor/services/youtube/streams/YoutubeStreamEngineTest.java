@@ -17,6 +17,71 @@ import org.schabi.newpipe.extractor.exceptions.ExtractionException;
 
 class YoutubeStreamEngineTest {
 
+    private ExtractionContext anonymousPlayback(final Downloader downloader) {
+        return new ExtractionContext(session(YoutubeSession.Account.ANONYMOUS), downloader,
+            (url, s, n, ctx) -> new ChallengeSolver.Solutions(Map.of(), Map.of()), null,
+            false, false, System.nanoTime() + TimeUnit.SECONDS.toNanos(45), () -> true,
+            (stage, profile, detail, duration, status) -> { });
+    }
+
+    @Test
+    void liveAdaptivePairDoesNotStopBeforeALaterManifest() throws Exception {
+        final List<String> clients = new ArrayList<>();
+        final Downloader transport = new Downloader() {
+            @Override
+            public Response execute(final Request request) {
+                final String body = new String(request.dataToSend(), java.nio.charset.StandardCharsets.UTF_8);
+                final String client = body.contains("\"clientName\":\"VISIONOS\"") ? "VISIONOS"
+                    : body.contains("Safari/605.1.15") ? "WEB_SAFARI" : "WEB";
+                clients.add(client);
+                return new Response(200, "OK", Map.of(), client.equals("WEB_SAFARI")
+                    ? HLS_WITH_FILES.replace("\"status\":\"OK\"", "\"status\":\"OK\",\"liveStreamability\":{}")
+                    : LIVE_PAIR, request.url());
+            }
+        };
+        final YoutubeStreamEngine.Result result = new YoutubeStreamEngine().extract(
+            "abcdefghijk", anonymousPlayback(transport));
+        assertEquals(List.of("VISIONOS", "WEB", "WEB_SAFARI"), clients);
+        assertFalse(result.manifests.isEmpty());
+        assertEquals(ClientProfile.WEB_SAFARI, result.manifests.get(0).requestPlan.profile);
+    }
+
+    @Test
+    void liveWithoutAManifestOrMuxedSourceFailsAfterBoundedProfiles() {
+        final List<Request> requests = new ArrayList<>();
+        final Downloader transport = new Downloader() {
+            @Override
+            public Response execute(final Request request) {
+                requests.add(request);
+                return new Response(200, "OK", Map.of(), LIVE_PAIR, request.url());
+            }
+        };
+        final ExtractionException failure = assertThrows(ExtractionException.class,
+            () -> new YoutubeStreamEngine().extract("abcdefghijk", anonymousPlayback(transport)));
+        assertEquals("LIVE_STREAM_SOURCE_UNAVAILABLE", failure.getMessage());
+        assertTrue(requests.size() <= 4);
+    }
+
+    @Test
+    void cancelledLiveExtractionNeverAdvancesToAnotherProfile() {
+        final java.util.concurrent.atomic.AtomicBoolean current = new java.util.concurrent.atomic.AtomicBoolean(true);
+        final List<Request> requests = new ArrayList<>();
+        final Downloader transport = new Downloader() {
+            @Override
+            public Response execute(final Request request) {
+                requests.add(request);
+                current.set(false);
+                return new Response(200, "OK", Map.of(), LIVE_PAIR, request.url());
+            }
+        };
+        final ExtractionContext context = new ExtractionContext(session(YoutubeSession.Account.ANONYMOUS), transport,
+            (url, s, n, ctx) -> new ChallengeSolver.Solutions(Map.of(), Map.of()), null,
+            false, false, System.nanoTime() + TimeUnit.SECONDS.toNanos(45), current::get,
+            (stage, profile, detail, duration, status) -> { });
+        assertThrows(IOException.class, () -> new YoutubeStreamEngine().extract("abcdefghijk", context));
+        assertEquals(1, requests.size());
+    }
+
     @Test
     void successfulProfileChangesTheNextProductionRouteAndSurvivesContextCopies() throws Exception {
         final List<String> requested = new ArrayList<>();
@@ -120,6 +185,9 @@ class YoutubeStreamEngineTest {
     private static final String FILE_PAIR = MEDIA.replace("\"adaptiveFormats\":[",
         "\"adaptiveFormats\":[{\"itag\":137,\"height\":1080,\"mimeType\":\"video/mp4; "
             + "codecs=\\\"avc1.640028\\\"\",\"url\":\"https://rr.googlevideo.com/videoplayback?id=v\"},");
+
+    private static final String LIVE_PAIR = FILE_PAIR.replace("\"status\":\"OK\"",
+        "\"status\":\"OK\",\"liveStreamability\":{}");
 
     @Test
     void catalogContinuesPastManifestsAndRetainsCaptionRequestContexts() throws Exception {

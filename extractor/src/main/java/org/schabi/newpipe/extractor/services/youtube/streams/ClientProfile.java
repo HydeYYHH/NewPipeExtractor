@@ -128,7 +128,7 @@ public enum ClientProfile {
         final boolean live,
         final boolean playback
     ) {
-        if (playback && session.account == YoutubeSession.Account.AUTHENTICATED) {
+        if (playback && !live && session.account == YoutubeSession.Account.AUTHENTICATED) {
             return List.of(WEB_SAFARI, VISIONOS, WEB, WEB_EMBEDDED, TV_DOWNGRADED);
         }
         return route(session, live);
